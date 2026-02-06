@@ -1,0 +1,554 @@
+# ============================================================================
+# JOURNEY ANALYSIS SUITE (WITH TIME DURATION)
+# ============================================================================
+
+%pip install prefixspan networkx plotly --quiet
+
+import pandas as pd
+import numpy as np
+import pickle, json
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+import plotly.graph_objects as go
+from prefixspan import PrefixSpan
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+MIN_USERS = 5
+MIN_PATTERN_SUPPORT = 0.01  # 1% of users
+
+# ============================================================================
+# LOAD DATA
+# ============================================================================
+
+print("Loading data...")
+
+test_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+with open(f'{DATA_DIR}results_{MODEL_NAME}.pkl', 'rb') as f:
+    results = pickle.load(f)
+
+test_df['actual'] = results['test_labels']
+test_df['pred'] = results['test_preds']
+pos_df = test_df[test_df['actual'] == 1]
+neg_df = test_df[test_df['actual'] == 0]
+
+print(f"Total: {len(test_df)} | Positive: {len(pos_df)} | Negative: {len(neg_df)}")
+
+# ============================================================================
+# HELPER: Extract sequence with time
+# ============================================================================
+
+def extract_journey(row):
+    """Extract (page, time) tuples, dedup consecutive"""
+    seq_raw = row['page_sequence_raw']
+    if not seq_raw:
+        return [], []
+    
+    # Sort by position
+    sorted_seq = sorted(seq_raw, key=lambda x: x['seq_position'] if isinstance(x, dict) else x.seq_position)
+    
+    pages, times = [], []
+    for item in sorted_seq:
+        page = item['page_group_c'] if isinstance(item, dict) else item.page_group_c
+        time = item['time_delta'] if isinstance(item, dict) else item.time_delta
+        
+        # Dedup consecutive
+        if pages and page == pages[-1]:
+            times[-1] += float(time or 0)
+        else:
+            pages.append(page)
+            times.append(float(time or 0))
+    
+    return pages, times
+
+# Extract for all users
+test_df['pages'], test_df['times'] = zip(*test_df.apply(extract_journey, axis=1))
+test_df['journey_length'] = test_df['pages'].apply(len)
+test_df['total_time'] = test_df['times'].apply(sum)
+
+pos_df = test_df[test_df['actual'] == 1]
+neg_df = test_df[test_df['actual'] == 0]
+
+# ============================================================================
+# REPORT 1: TOP SUCCESSFUL vs FAILED JOURNEYS (with PrefixSpan)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 1: TOP SUCCESSFUL vs FAILED JOURNEYS")
+print("="*70)
+
+def get_journey_patterns(df, min_support_pct=0.01, min_len=5, max_len=50):
+    """Use PrefixSpan to find frequent patterns with time info"""
+    
+    # Prepare sequences
+    sequences = df['pages'].tolist()
+    times_list = df['times'].tolist()
+    
+    # Filter by length
+    valid_idx = [i for i, s in enumerate(sequences) if min_len <= len(s) <= max_len]
+    sequences = [sequences[i] for i in valid_idx]
+    times_list = [times_list[i] for i in valid_idx]
+    
+    if len(sequences) < 10:
+        return []
+    
+    # Run PrefixSpan
+    ps = PrefixSpan(sequences)
+    ps.minlen = min_len
+    ps.maxlen = min(max_len, 20)  # Cap for performance
+    
+    min_support = max(int(len(sequences) * min_support_pct), MIN_USERS)
+    patterns = ps.frequent(min_support)
+    
+    # Calculate time stats for each pattern
+    pattern_stats = []
+    for support, pattern in patterns:
+        pattern_tuple = tuple(pattern)
+        
+        # Find users with this pattern and get their times
+        matching_times = []
+        for seq, times in zip(sequences, times_list):
+            # Check if pattern exists in sequence
+            seq_str = '→'.join(seq)
+            pat_str = '→'.join(pattern)
+            if pat_str in seq_str:
+                # Get time for pattern portion
+                start_idx = seq.index(pattern[0]) if pattern[0] in seq else 0
+                end_idx = min(start_idx + len(pattern), len(times))
+                matching_times.append(sum(times[start_idx:end_idx]))
+        
+        if matching_times:
+            pattern_stats.append({
+                'pattern': ' → '.join(pattern),
+                'length': len(pattern),
+                'users': support,
+                'avg_time': round(np.mean(matching_times) / 60, 1),  # minutes
+                'median_time': round(np.median(matching_times) / 60, 1),
+                'time_per_step': round(np.mean(matching_times) / len(pattern) / 60, 1)
+            })
+    
+    return sorted(pattern_stats, key=lambda x: (-x['users'], -x['length']))
+
+print("\nExtracting positive journey patterns...")
+pos_patterns = get_journey_patterns(pos_df, min_support_pct=0.02, min_len=5, max_len=20)
+
+print("Extracting negative journey patterns...")
+neg_patterns = get_journey_patterns(neg_df, min_support_pct=0.02, min_len=5, max_len=20)
+
+print(f"\nPositive patterns found: {len(pos_patterns)}")
+print(f"Negative patterns found: {len(neg_patterns)}")
+
+# Display top patterns
+print("\n" + "-"*70)
+print("TOP 10 SUCCESSFUL JOURNEYS")
+print("-"*70)
+print(f"{'Pattern':<50} | Users | Avg Time | Per Step")
+print("-"*70)
+for p in pos_patterns[:10]:
+    print(f"{p['pattern'][:50]:<50} | {p['users']:>5} | {p['avg_time']:>6} min | {p['time_per_step']:>4} min")
+
+print("\n" + "-"*70)
+print("TOP 10 FAILED JOURNEYS")
+print("-"*70)
+print(f"{'Pattern':<50} | Users | Avg Time | Per Step")
+print("-"*70)
+for p in neg_patterns[:10]:
+    print(f"{p['pattern'][:50]:<50} | {p['users']:>5} | {p['avg_time']:>6} min | {p['time_per_step']:>4} min")
+
+# Save
+pd.DataFrame(pos_patterns).to_csv(f'{DATA_DIR}successful_journeys_{MODEL_NAME}.csv', index=False)
+pd.DataFrame(neg_patterns).to_csv(f'{DATA_DIR}failed_journeys_{MODEL_NAME}.csv', index=False)
+
+# ============================================================================
+# REPORT 2: PAGE ANALYSIS (with Time)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 2: PAGE ANALYSIS (with Time)")
+print("="*70)
+
+def get_page_stats(df):
+    """Calculate page-level stats with time"""
+    stats = defaultdict(lambda: {'visits': 0, 'total_time': 0, 'users': 0})
+    
+    for _, row in df.iterrows():
+        seen = set()
+        for page, time in zip(row['pages'], row['times']):
+            stats[page]['visits'] += 1
+            stats[page]['total_time'] += time
+            if page not in seen:
+                stats[page]['users'] += 1
+                seen.add(page)
+    
+    return stats
+
+pos_stats = get_page_stats(pos_df)
+neg_stats = get_page_stats(neg_df)
+
+# Build comparison
+page_analysis = []
+all_pages = set(pos_stats.keys()) | set(neg_stats.keys())
+
+for page in all_pages:
+    pos = pos_stats.get(page, {'visits': 0, 'total_time': 0, 'users': 0})
+    neg = neg_stats.get(page, {'visits': 0, 'total_time': 0, 'users': 0})
+    
+    if pos['visits'] + neg['visits'] < MIN_USERS:
+        continue
+    
+    pos_avg_time = pos['total_time'] / pos['visits'] / 60 if pos['visits'] > 0 else 0
+    neg_avg_time = neg['total_time'] / neg['visits'] / 60 if neg['visits'] > 0 else 0
+    
+    time_lift = pos_avg_time / neg_avg_time if neg_avg_time > 0 else 5.0
+    visit_lift = (pos['visits'] / len(pos_df)) / (neg['visits'] / len(neg_df)) if neg['visits'] > 0 else 5.0
+    
+    page_analysis.append({
+        'page': page,
+        'pos_users': pos['users'],
+        'neg_users': neg['users'],
+        'pos_visits': pos['visits'],
+        'neg_visits': neg['visits'],
+        'pos_avg_time_min': round(pos_avg_time, 2),
+        'neg_avg_time_min': round(neg_avg_time, 2),
+        'time_lift': round(time_lift, 2),
+        'visit_lift': round(visit_lift, 2),
+        'signal': 'positive' if time_lift > 1.2 and visit_lift > 1.2 else ('negative' if time_lift < 0.8 or visit_lift < 0.8 else 'neutral')
+    })
+
+page_df = pd.DataFrame(page_analysis).sort_values('time_lift', ascending=False)
+
+print(f"\n{'Page':<30} | Pos Time | Neg Time | Time Lift | Signal")
+print("-"*70)
+for _, r in page_df.head(15).iterrows():
+    print(f"{r['page'][:30]:<30} | {r['pos_avg_time_min']:>6} min | {r['neg_avg_time_min']:>6} min | {r['time_lift']:>7}x | {r['signal']}")
+
+page_df.to_csv(f'{DATA_DIR}page_analysis_{MODEL_NAME}.csv', index=False)
+
+# ============================================================================
+# REPORT 3: EXIT ANALYSIS (with Time)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 3: EXIT ANALYSIS (Non-Starters)")
+print("="*70)
+
+def get_exit_stats(df):
+    """Analyze last page before exit"""
+    exits = []
+    
+    for _, row in df.iterrows():
+        if len(row['pages']) > 0:
+            exits.append({
+                'last_page': row['pages'][-1],
+                'time_on_last': row['times'][-1] if row['times'] else 0,
+                'journey_time': sum(row['times']),
+                'journey_length': len(row['pages'])
+            })
+    
+    return pd.DataFrame(exits)
+
+exit_df = get_exit_stats(neg_df)
+
+# Aggregate by last page
+exit_summary = exit_df.groupby('last_page').agg({
+    'time_on_last': ['count', 'mean', 'median'],
+    'journey_time': ['mean', 'median'],
+    'journey_length': 'mean'
+}).reset_index()
+
+exit_summary.columns = ['last_page', 'users', 'avg_time_on_last', 'median_time_on_last', 
+                        'avg_journey_time', 'median_journey_time', 'avg_journey_length']
+
+exit_summary['pct_of_exits'] = round(exit_summary['users'] / len(neg_df) * 100, 1)
+exit_summary['avg_time_on_last'] = round(exit_summary['avg_time_on_last'] / 60, 2)
+exit_summary['avg_journey_time'] = round(exit_summary['avg_journey_time'] / 60, 2)
+exit_summary = exit_summary.sort_values('users', ascending=False)
+
+print(f"\n{'Last Page':<25} | Users | % Exits | Time on Last | Journey Time")
+print("-"*70)
+for _, r in exit_summary.head(15).iterrows():
+    print(f"{r['last_page'][:25]:<25} | {r['users']:>5} | {r['pct_of_exits']:>5}% | {r['avg_time_on_last']:>8} min | {r['avg_journey_time']:>8} min")
+
+exit_summary.to_csv(f'{DATA_DIR}exit_analysis_{MODEL_NAME}.csv', index=False)
+
+# ============================================================================
+# REPORT 4: JOURNEY SUMMARY STATS
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 4: JOURNEY SUMMARY STATS")
+print("="*70)
+
+summary_stats = {
+    'Metric': [
+        'Avg Journey Length (pages)',
+        'Median Journey Length',
+        'Avg Total Time (min)',
+        'Median Total Time (min)',
+        'Avg Time per Page (min)',
+        'Velocity (pages/min)',
+        'Users'
+    ],
+    'Completers': [
+        round(pos_df['journey_length'].mean(), 1),
+        round(pos_df['journey_length'].median(), 1),
+        round(pos_df['total_time'].mean() / 60, 1),
+        round(pos_df['total_time'].median() / 60, 1),
+        round(pos_df['total_time'].mean() / pos_df['journey_length'].mean() / 60, 2),
+        round(pos_df['journey_length'].mean() / (pos_df['total_time'].mean() / 60), 2),
+        len(pos_df)
+    ],
+    'Non-Completers': [
+        round(neg_df['journey_length'].mean(), 1),
+        round(neg_df['journey_length'].median(), 1),
+        round(neg_df['total_time'].mean() / 60, 1),
+        round(neg_df['total_time'].median() / 60, 1),
+        round(neg_df['total_time'].mean() / neg_df['journey_length'].mean() / 60, 2),
+        round(neg_df['journey_length'].mean() / (neg_df['total_time'].mean() / 60), 2),
+        len(neg_df)
+    ]
+}
+
+summary_df = pd.DataFrame(summary_stats)
+summary_df['Difference'] = [''] * len(summary_df)
+
+for i, row in summary_df.iterrows():
+    if row['Metric'] != 'Users':
+        diff = row['Completers'] - row['Non-Completers']
+        pct = diff / row['Non-Completers'] * 100 if row['Non-Completers'] != 0 else 0
+        summary_df.at[i, 'Difference'] = f"{'+' if diff > 0 else ''}{pct:.0f}%"
+
+print(summary_df.to_string(index=False))
+summary_df.to_csv(f'{DATA_DIR}journey_summary_{MODEL_NAME}.csv', index=False)
+
+# ============================================================================
+# REPORT 5: TRANSITION ANALYSIS (with Time)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 5: TRANSITION ANALYSIS")
+print("="*70)
+
+def get_transitions(df):
+    """Get transitions with time on source page"""
+    transitions = defaultdict(lambda: {'count': 0, 'time_on_source': []})
+    
+    for _, row in df.iterrows():
+        pages, times = row['pages'], row['times']
+        for i in range(len(pages) - 1):
+            key = (pages[i], pages[i+1])
+            transitions[key]['count'] += 1
+            transitions[key]['time_on_source'].append(times[i])
+    
+    return transitions
+
+pos_trans = get_transitions(pos_df)
+neg_trans = get_transitions(neg_df)
+
+# Build comparison
+trans_analysis = []
+all_trans = set(pos_trans.keys()) | set(neg_trans.keys())
+
+for (src, dst) in all_trans:
+    pos = pos_trans.get((src, dst), {'count': 0, 'time_on_source': []})
+    neg = neg_trans.get((src, dst), {'count': 0, 'time_on_source': []})
+    
+    if pos['count'] + neg['count'] < MIN_USERS:
+        continue
+    
+    pos_time = np.mean(pos['time_on_source']) / 60 if pos['time_on_source'] else 0
+    neg_time = np.mean(neg['time_on_source']) / 60 if neg['time_on_source'] else 0
+    
+    conv_rate = pos['count'] / (pos['count'] + neg['count']) if (pos['count'] + neg['count']) > 0 else 0
+    
+    trans_analysis.append({
+        'from': src,
+        'to': dst,
+        'pos_count': pos['count'],
+        'neg_count': neg['count'],
+        'total_count': pos['count'] + neg['count'],
+        'conversion_rate': round(conv_rate, 2),
+        'pos_time_on_source': round(pos_time, 2),
+        'neg_time_on_source': round(neg_time, 2),
+        'time_diff': round(pos_time - neg_time, 2)
+    })
+
+trans_df = pd.DataFrame(trans_analysis).sort_values('conversion_rate', ascending=False)
+
+print(f"\n{'From':<20} → {'To':<20} | Conv % | Pos Time | Neg Time")
+print("-"*70)
+for _, r in trans_df.head(15).iterrows():
+    print(f"{r['from'][:20]:<20} → {r['to'][:20]:<20} | {r['conversion_rate']*100:>5.0f}% | {r['pos_time_on_source']:>6} min | {r['neg_time_on_source']:>6} min")
+
+trans_df.to_csv(f'{DATA_DIR}transitions_{MODEL_NAME}.csv', index=False)
+
+# ============================================================================
+# VISUALIZATION 1: Journey Comparison
+# ============================================================================
+
+print("\n" + "="*70)
+print("CREATING VISUALIZATIONS")
+print("="*70)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# 1a. Journey Length Distribution
+ax1 = axes[0, 0]
+ax1.hist(neg_df['journey_length'], bins=30, alpha=0.6, label='Non-Completers', color='#e74c3c', density=True)
+ax1.hist(pos_df['journey_length'], bins=30, alpha=0.6, label='Completers', color='#27ae60', density=True)
+ax1.set_xlabel('Journey Length (pages)')
+ax1.set_ylabel('Density')
+ax1.set_title('Journey Length Distribution')
+ax1.legend()
+ax1.axvline(pos_df['journey_length'].mean(), color='#27ae60', linestyle='--')
+ax1.axvline(neg_df['journey_length'].mean(), color='#e74c3c', linestyle='--')
+
+# 1b. Journey Time Distribution
+ax2 = axes[0, 1]
+ax2.hist(neg_df['total_time']/60, bins=30, alpha=0.6, label='Non-Completers', color='#e74c3c', density=True, range=(0, 30))
+ax2.hist(pos_df['total_time']/60, bins=30, alpha=0.6, label='Completers', color='#27ae60', density=True, range=(0, 30))
+ax2.set_xlabel('Total Journey Time (minutes)')
+ax2.set_ylabel('Density')
+ax2.set_title('Journey Time Distribution')
+ax2.legend()
+
+# 1c. Top Exit Pages
+ax3 = axes[1, 0]
+top_exits = exit_summary.head(10)
+colors = plt.cm.Reds(np.linspace(0.4, 0.9, len(top_exits)))
+ax3.barh(range(len(top_exits)), top_exits['pct_of_exits'], color=colors)
+ax3.set_yticks(range(len(top_exits)))
+ax3.set_yticklabels(top_exits['last_page'].str[:25])
+ax3.invert_yaxis()
+ax3.set_xlabel('% of Exits')
+ax3.set_title('Top Exit Pages (Non-Starters)')
+
+# 1d. Page Time Comparison (Top 10)
+ax4 = axes[1, 1]
+top_pages = page_df.head(10)
+x = np.arange(len(top_pages))
+width = 0.35
+ax4.bar(x - width/2, top_pages['pos_avg_time_min'], width, label='Completers', color='#27ae60')
+ax4.bar(x + width/2, top_pages['neg_avg_time_min'], width, label='Non-Completers', color='#e74c3c')
+ax4.set_ylabel('Avg Time (min)')
+ax4.set_title('Time per Page: Completers vs Non-Completers')
+ax4.set_xticks(x)
+ax4.set_xticklabels([p[:15] for p in top_pages['page']], rotation=45, ha='right')
+ax4.legend()
+
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}journey_analysis_{MODEL_NAME}.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved: journey_analysis_{MODEL_NAME}.png")
+
+# ============================================================================
+# VISUALIZATION 2: Sankey Flow Diagram
+# ============================================================================
+
+def create_sankey(trans_df, title, filename, top_n=20):
+    """Create Sankey diagram from transitions"""
+    
+    top_trans = trans_df.head(top_n)
+    
+    # Get unique nodes
+    all_nodes = list(set(top_trans['from'].tolist() + top_trans['to'].tolist()))
+    node_idx = {node: i for i, node in enumerate(all_nodes)}
+    
+    # Build links
+    source = [node_idx[r['from']] for _, r in top_trans.iterrows()]
+    target = [node_idx[r['to']] for _, r in top_trans.iterrows()]
+    value = top_trans['total_count'].tolist()
+    
+    # Color by conversion rate
+    colors = [f'rgba(39, 174, 96, {r["conversion_rate"]})' for _, r in top_trans.iterrows()]
+    
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            pad=15,
+            thickness=20,
+            line=dict(color='black', width=0.5),
+            label=all_nodes,
+            color='lightblue'
+        ),
+        link=dict(
+            source=source,
+            target=target,
+            value=value,
+            color=colors
+        )
+    )])
+    
+    fig.update_layout(title_text=title, font_size=10)
+    fig.write_html(f'{DATA_DIR}{filename}')
+    print(f"✓ Saved: {filename}")
+
+create_sankey(trans_df, f'{MODEL_NAME.upper()} Journey Flow (Top Transitions)', f'sankey_{MODEL_NAME}.html')
+
+# ============================================================================
+# VISUALIZATION 3: Transition Heatmap
+# ============================================================================
+
+def create_transition_heatmap(trans_df, filename, top_n=15):
+    """Create heatmap of transitions"""
+    
+    # Get top pages by total transitions
+    page_counts = Counter()
+    for _, r in trans_df.iterrows():
+        page_counts[r['from']] += r['total_count']
+        page_counts[r['to']] += r['total_count']
+    
+    top_pages = [p[0] for p in page_counts.most_common(top_n)]
+    
+    # Build matrix
+    matrix = np.zeros((top_n, top_n))
+    for _, r in trans_df.iterrows():
+        if r['from'] in top_pages and r['to'] in top_pages:
+            i = top_pages.index(r['from'])
+            j = top_pages.index(r['to'])
+            matrix[i, j] = r['conversion_rate']
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(12, 10))
+    sns.heatmap(matrix, annot=True, fmt='.0%', cmap='RdYlGn',
+                xticklabels=[p[:20] for p in top_pages],
+                yticklabels=[p[:20] for p in top_pages], ax=ax)
+    ax.set_xlabel('To Page')
+    ax.set_ylabel('From Page')
+    ax.set_title('Transition Conversion Rate (Green = High Conversion)')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig(f'{DATA_DIR}{filename}', dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"✓ Saved: {filename}")
+
+create_transition_heatmap(trans_df, f'heatmap_{MODEL_NAME}.png')
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+
+print("\n" + "="*70)
+print("SUMMARY: FILES CREATED")
+print("="*70)
+print(f"""
+CSV Reports:
+├── successful_journeys_{MODEL_NAME}.csv
+├── failed_journeys_{MODEL_NAME}.csv
+├── page_analysis_{MODEL_NAME}.csv
+├── exit_analysis_{MODEL_NAME}.csv
+├── journey_summary_{MODEL_NAME}.csv
+└── transitions_{MODEL_NAME}.csv
+
+Visualizations:
+├── journey_analysis_{MODEL_NAME}.png
+├── sankey_{MODEL_NAME}.html (interactive)
+└── heatmap_{MODEL_NAME}.png
+
+✓ ALL REPORTS COMPLETE
+""")
