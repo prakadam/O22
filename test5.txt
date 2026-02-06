@@ -1,0 +1,698 @@
+# ============================================================================
+# COMPREHENSIVE JOURNEY ANALYSIS
+# SET-BASED | CUMULATIVE TIME | FULL DATASET | QUALITY FILTERED
+# ============================================================================
+
+import pandas as pd
+import numpy as np
+import pickle, json
+from collections import Counter, defaultdict
+from itertools import combinations
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# Quality Filters
+MIN_JOURNEY_LENGTH = 5          # At least 5 unique pages
+MIN_TOTAL_TIME_SEC = 60         # At least 1 minute
+MIN_TIME_PER_PAGE_SEC = 5       # Remove <5 sec pages (noise)
+REMOVE_TOP_PERCENTILE = 10      # Remove top 10% outliers
+MIN_USERS = 20                  # Minimum users for pattern
+
+# ============================================================================
+# LOAD FULL DATASET (Train + Val + Test)
+# ============================================================================
+
+print("="*70)
+print("LOADING FULL DATASET")
+print("="*70)
+
+train_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_train.parquet')
+val_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_val.parquet')
+test_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+
+full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+
+with open(f'{DATA_DIR}page_vocab_{MODEL_NAME}.json', 'r') as f:
+    page_vocab = json.load(f)
+id_to_page = {v: k for k, v in page_vocab.items()}
+
+print(f"Total users: {len(full_df):,}")
+print(f"Positive (completers): {full_df['label'].sum():,}")
+print(f"Negative (non-completers): {(1 - full_df['label']).sum():,}")
+
+# ============================================================================
+# EXTRACT JOURNEYS (SET-BASED WITH CUMULATIVE TIME)
+# ============================================================================
+
+print("\n" + "="*70)
+print("EXTRACTING JOURNEYS")
+print("="*70)
+
+def extract_journey(row, id_to_page, min_page_time=5):
+    """
+    Extract journey as SET (not sequence)
+    - Dedup anywhere (same page visited multiple times = sum time)
+    - Filter noise (<5 sec pages)
+    - Return: page_times dict, page_visits dict, total_time, unique_pages
+    """
+    page_ids = row['page_ids']
+    time_deltas = row['time_deltas']
+    
+    if page_ids is None or len(page_ids) == 0:
+        return {}, {}, 0, 0
+    
+    page_times = {}
+    page_visits = {}
+    
+    for pid, time in zip(page_ids, time_deltas):
+        if pid == 0:
+            continue
+        
+        page = id_to_page.get(pid, 'UNK')
+        time_val = float(time or 0)
+        
+        if page in page_times:
+            page_times[page] += time_val
+            page_visits[page] += 1
+        else:
+            page_times[page] = time_val
+            page_visits[page] = 1
+    
+    # Filter noise: remove pages with cumulative time < min_page_time
+    clean_times = {p: t for p, t in page_times.items() if t >= min_page_time}
+    clean_visits = {p: v for p, v in page_visits.items() if p in clean_times}
+    
+    total_time = sum(clean_times.values())
+    unique_pages = len(clean_times)
+    
+    return clean_times, clean_visits, total_time, unique_pages
+
+# Apply to all users
+results = full_df.apply(lambda row: extract_journey(row, id_to_page, MIN_TIME_PER_PAGE_SEC), axis=1)
+full_df['page_times'] = [r[0] for r in results]
+full_df['page_visits'] = [r[1] for r in results]
+full_df['total_time'] = [r[2] for r in results]
+full_df['unique_pages'] = [r[3] for r in results]
+
+print(f"Journeys extracted: {len(full_df):,}")
+
+# ============================================================================
+# QUALITY FILTER: REMOVE NOISE AND OUTLIERS
+# ============================================================================
+
+print("\n" + "="*70)
+print("APPLYING QUALITY FILTERS")
+print("="*70)
+
+# Before filtering stats
+print(f"\nBefore filtering:")
+print(f"  Total users: {len(full_df):,}")
+print(f"  Time P50: {full_df['total_time'].quantile(0.50)/60:.1f} min")
+print(f"  Time P90: {full_df['total_time'].quantile(0.90)/60:.1f} min")
+print(f"  Pages P50: {full_df['unique_pages'].quantile(0.50):.0f}")
+print(f"  Pages P90: {full_df['unique_pages'].quantile(0.90):.0f}")
+
+# Calculate cutoffs
+time_p90 = full_df['total_time'].quantile(1 - REMOVE_TOP_PERCENTILE/100)
+
+# Apply filters
+quality_df = full_df[
+    (full_df['unique_pages'] >= MIN_JOURNEY_LENGTH) &
+    (full_df['total_time'] >= MIN_TOTAL_TIME_SEC) &
+    (full_df['total_time'] <= time_p90)
+].copy()
+
+print(f"\nAfter filtering:")
+print(f"  Quality users: {len(quality_df):,} ({len(quality_df)/len(full_df)*100:.0f}%)")
+print(f"  Time range: {quality_df['total_time'].min()/60:.1f} - {quality_df['total_time'].max()/60:.1f} min")
+print(f"  Pages range: {quality_df['unique_pages'].min():.0f} - {quality_df['unique_pages'].max():.0f}")
+
+# Split by outcome
+pos_df = quality_df[quality_df['label'] == 1].copy()
+neg_df = quality_df[quality_df['label'] == 0].copy()
+
+print(f"\n  Positive (completers): {len(pos_df):,}")
+print(f"  Negative (non-completers): {len(neg_df):,}")
+
+# ============================================================================
+# REPORT 1: PAGE PRESENCE & CUMULATIVE TIME ANALYSIS
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 1: PAGE PRESENCE & CUMULATIVE TIME")
+print("="*70)
+
+def analyze_pages(pos_df, neg_df):
+    """Analyze each page: presence, cumulative time, visits"""
+    
+    # Aggregate for positive
+    pos_stats = defaultdict(lambda: {'users': 0, 'cum_time': 0, 'cum_visits': 0, 'times': []})
+    for _, row in pos_df.iterrows():
+        for page, time in row['page_times'].items():
+            pos_stats[page]['users'] += 1
+            pos_stats[page]['cum_time'] += time
+            pos_stats[page]['cum_visits'] += row['page_visits'].get(page, 1)
+            pos_stats[page]['times'].append(time)
+    
+    # Aggregate for negative
+    neg_stats = defaultdict(lambda: {'users': 0, 'cum_time': 0, 'cum_visits': 0, 'times': []})
+    for _, row in neg_df.iterrows():
+        for page, time in row['page_times'].items():
+            neg_stats[page]['users'] += 1
+            neg_stats[page]['cum_time'] += time
+            neg_stats[page]['cum_visits'] += row['page_visits'].get(page, 1)
+            neg_stats[page]['times'].append(time)
+    
+    # Build comparison
+    all_pages = set(pos_stats.keys()) | set(neg_stats.keys())
+    
+    results = []
+    for page in all_pages:
+        pos = pos_stats.get(page, {'users': 0, 'cum_time': 0, 'cum_visits': 0, 'times': []})
+        neg = neg_stats.get(page, {'users': 0, 'cum_time': 0, 'cum_visits': 0, 'times': []})
+        
+        total_users = pos['users'] + neg['users']
+        if total_users < MIN_USERS:
+            continue
+        
+        # Presence rate
+        pos_presence = pos['users'] / len(pos_df) * 100 if len(pos_df) > 0 else 0
+        neg_presence = neg['users'] / len(neg_df) * 100 if len(neg_df) > 0 else 0
+        presence_lift = pos_presence / neg_presence if neg_presence > 0 else 5.0
+        
+        # Cumulative time (total across all users)
+        pos_cum_time = pos['cum_time'] / 60  # to minutes
+        neg_cum_time = neg['cum_time'] / 60
+        
+        # Median time per user (for those who visited)
+        pos_median_time = np.median(pos['times']) / 60 if pos['times'] else 0
+        neg_median_time = np.median(neg['times']) / 60 if neg['times'] else 0
+        time_lift = pos_median_time / neg_median_time if neg_median_time > 0 else 5.0
+        
+        # Conversion rate for users who visited this page
+        conversion_rate = pos['users'] / total_users if total_users > 0 else 0
+        
+        results.append({
+            'page': page,
+            'pos_users': pos['users'],
+            'neg_users': neg['users'],
+            'total_users': total_users,
+            'pos_presence_pct': round(pos_presence, 1),
+            'neg_presence_pct': round(neg_presence, 1),
+            'presence_lift': round(presence_lift, 2),
+            'pos_cum_time_min': round(pos_cum_time, 1),
+            'neg_cum_time_min': round(neg_cum_time, 1),
+            'pos_median_time_min': round(pos_median_time, 2),
+            'neg_median_time_min': round(neg_median_time, 2),
+            'time_lift': round(time_lift, 2),
+            'conversion_rate': round(conversion_rate * 100, 1),
+            'signal': 'POSITIVE' if presence_lift > 1.3 and time_lift > 1.2 else (
+                'NEGATIVE' if presence_lift < 0.7 or time_lift < 0.8 else 'NEUTRAL'
+            )
+        })
+    
+    return sorted(results, key=lambda x: (-x['presence_lift'], -x['total_users']))
+
+page_analysis = analyze_pages(pos_df, neg_df)
+page_df = pd.DataFrame(page_analysis)
+
+print(f"\nPages analyzed: {len(page_df)}")
+print(f"\n{'Page':<30} | {'Pos %':<7} | {'Neg %':<7} | {'Lift':<6} | {'Pos Time':<10} | {'Neg Time':<10} | Signal")
+print("-"*100)
+
+for _, r in page_df.head(15).iterrows():
+    print(f"{r['page'][:30]:<30} | {r['pos_presence_pct']:<7} | {r['neg_presence_pct']:<7} | {r['presence_lift']:<6}x | {r['pos_median_time_min']:<10} | {r['neg_median_time_min']:<10} | {r['signal']}")
+
+print("\n... NEGATIVE SIGNALS (Bottom 10) ...")
+for _, r in page_df.tail(10).iterrows():
+    print(f"{r['page'][:30]:<30} | {r['pos_presence_pct']:<7} | {r['neg_presence_pct']:<7} | {r['presence_lift']:<6}x | {r['pos_median_time_min']:<10} | {r['neg_median_time_min']:<10} | {r['signal']}")
+
+# ============================================================================
+# REPORT 2: PAGE SET COMBINATIONS (Which pages appear together)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 2: PAGE SET COMBINATIONS")
+print("="*70)
+
+def analyze_page_sets(pos_df, neg_df, set_sizes=[2, 3, 4, 5], min_users=20):
+    """Analyze which page combinations appear together"""
+    
+    all_results = []
+    
+    for size in set_sizes:
+        pos_sets = Counter()
+        neg_sets = Counter()
+        pos_times = defaultdict(list)
+        neg_times = defaultdict(list)
+        
+        # Count positive
+        for _, row in pos_df.iterrows():
+            pages = list(row['page_times'].keys())
+            total_time = row['total_time']
+            
+            if len(pages) >= size:
+                for combo in combinations(sorted(pages), size):
+                    pos_sets[combo] += 1
+                    pos_times[combo].append(total_time)
+        
+        # Count negative
+        for _, row in neg_df.iterrows():
+            pages = list(row['page_times'].keys())
+            total_time = row['total_time']
+            
+            if len(pages) >= size:
+                for combo in combinations(sorted(pages), size):
+                    neg_sets[combo] += 1
+                    neg_times[combo].append(total_time)
+        
+        # Build results
+        all_combos = set(pos_sets.keys()) | set(neg_sets.keys())
+        
+        for combo in all_combos:
+            pos_count = pos_sets.get(combo, 0)
+            neg_count = neg_sets.get(combo, 0)
+            total = pos_count + neg_count
+            
+            if total < min_users:
+                continue
+            
+            pos_rate = pos_count / len(pos_df) if len(pos_df) > 0 else 0
+            neg_rate = neg_count / len(neg_df) if len(neg_df) > 0 else 0
+            lift = pos_rate / neg_rate if neg_rate > 0 else 5.0
+            
+            conversion = pos_count / total if total > 0 else 0
+            
+            # Cumulative time
+            pos_cum = sum(pos_times.get(combo, [])) / 60
+            neg_cum = sum(neg_times.get(combo, [])) / 60
+            
+            # Median time
+            pos_median = np.median(pos_times.get(combo, [0])) / 60
+            neg_median = np.median(neg_times.get(combo, [0])) / 60
+            
+            all_results.append({
+                'set_size': size,
+                'page_set': ' + '.join(combo),
+                'pos_users': pos_count,
+                'neg_users': neg_count,
+                'total_users': total,
+                'lift': round(lift, 2),
+                'conversion_pct': round(conversion * 100, 1),
+                'pos_cum_time_min': round(pos_cum, 1),
+                'neg_cum_time_min': round(neg_cum, 1),
+                'pos_median_time_min': round(pos_median, 1),
+                'neg_median_time_min': round(neg_median, 1)
+            })
+    
+    return sorted(all_results, key=lambda x: (-x['lift'], -x['total_users']))
+
+page_sets = analyze_page_sets(pos_df, neg_df, set_sizes=[2, 3, 4, 5], min_users=MIN_USERS)
+sets_df = pd.DataFrame(page_sets)
+
+print(f"\nPage combinations analyzed: {len(sets_df)}")
+
+for size in [2, 3, 4, 5]:
+    subset = sets_df[sets_df['set_size'] == size]
+    print(f"\n--- {size}-PAGE COMBINATIONS (Top 10) ---")
+    print(f"{'Pages':<60} | {'Users':<7} | {'Conv %':<7} | {'Lift':<6} | Pos Time | Neg Time")
+    print("-"*110)
+    
+    for _, r in subset.head(10).iterrows():
+        print(f"{r['page_set'][:60]:<60} | {r['total_users']:<7} | {r['conversion_pct']:<7} | {r['lift']:<6}x | {r['pos_median_time_min']:<8} | {r['neg_median_time_min']:<8}")
+
+# ============================================================================
+# REPORT 3: JOURNEY PROFILE ANALYSIS (Full journey characteristics)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 3: JOURNEY PROFILE ANALYSIS")
+print("="*70)
+
+def analyze_journey_profiles(pos_df, neg_df):
+    """Analyze overall journey characteristics"""
+    
+    metrics = {
+        'Metric': [],
+        'Completers': [],
+        'Non-Completers': [],
+        'Difference': [],
+        'Insight': []
+    }
+    
+    # 1. Unique pages
+    pos_pages = pos_df['unique_pages']
+    neg_pages = neg_df['unique_pages']
+    diff = (pos_pages.median() - neg_pages.median()) / neg_pages.median() * 100
+    metrics['Metric'].append('Unique Pages (Median)')
+    metrics['Completers'].append(f"{pos_pages.median():.0f}")
+    metrics['Non-Completers'].append(f"{neg_pages.median():.0f}")
+    metrics['Difference'].append(f"{'+' if diff > 0 else ''}{diff:.0f}%")
+    metrics['Insight'].append('More pages = more research' if diff > 0 else 'Fewer pages visited')
+    
+    # 2. Total time
+    pos_time = pos_df['total_time'] / 60
+    neg_time = neg_df['total_time'] / 60
+    diff = (pos_time.median() - neg_time.median()) / neg_time.median() * 100
+    metrics['Metric'].append('Total Time (Median, min)')
+    metrics['Completers'].append(f"{pos_time.median():.1f}")
+    metrics['Non-Completers'].append(f"{neg_time.median():.1f}")
+    metrics['Difference'].append(f"{'+' if diff > 0 else ''}{diff:.0f}%")
+    metrics['Insight'].append('More engaged' if diff > 0 else 'Less time spent')
+    
+    # 3. Cumulative time (sum of all users)
+    pos_cum = pos_time.sum()
+    neg_cum = neg_time.sum()
+    metrics['Metric'].append('Cumulative Time (Total, hrs)')
+    metrics['Completers'].append(f"{pos_cum/60:.0f}")
+    metrics['Non-Completers'].append(f"{neg_cum/60:.0f}")
+    metrics['Difference'].append(f"Ratio: {pos_cum/neg_cum:.2f}x")
+    metrics['Insight'].append('Total investment by group')
+    
+    # 4. Time per page
+    pos_tpp = pos_time / pos_pages
+    neg_tpp = neg_time / neg_pages
+    diff = (pos_tpp.median() - neg_tpp.median()) / neg_tpp.median() * 100
+    metrics['Metric'].append('Time per Page (Median, min)')
+    metrics['Completers'].append(f"{pos_tpp.median():.2f}")
+    metrics['Non-Completers'].append(f"{neg_tpp.median():.2f}")
+    metrics['Difference'].append(f"{'+' if diff > 0 else ''}{diff:.0f}%")
+    metrics['Insight'].append('Reading vs scanning' if diff > 0 else 'Rushing through')
+    
+    # 5. Velocity (pages per minute)
+    pos_vel = pos_pages / pos_time
+    neg_vel = neg_pages / neg_time
+    diff = (pos_vel.median() - neg_vel.median()) / neg_vel.median() * 100
+    metrics['Metric'].append('Velocity (pages/min)')
+    metrics['Completers'].append(f"{pos_vel.median():.2f}")
+    metrics['Non-Completers'].append(f"{neg_vel.median():.2f}")
+    metrics['Difference'].append(f"{'+' if diff > 0 else ''}{diff:.0f}%")
+    metrics['Insight'].append('Lower = more careful' if diff < 0 else 'Higher = more scanning')
+    
+    # 6. User count
+    metrics['Metric'].append('Total Users')
+    metrics['Completers'].append(f"{len(pos_df):,}")
+    metrics['Non-Completers'].append(f"{len(neg_df):,}")
+    metrics['Difference'].append(f"Ratio: 1:{len(neg_df)//len(pos_df)}")
+    metrics['Insight'].append('Class imbalance')
+    
+    return pd.DataFrame(metrics)
+
+profile_df = analyze_journey_profiles(pos_df, neg_df)
+print(profile_df.to_string(index=False))
+
+# ============================================================================
+# REPORT 4: KEY PAGE JOURNEYS (Which pages lead to conversion)
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 4: KEY PAGE IMPACT ON CONVERSION")
+print("="*70)
+
+def analyze_page_impact(pos_df, neg_df, page_df):
+    """For each key page, analyze its impact"""
+    
+    results = []
+    
+    # Get top positive and negative signal pages
+    top_positive = page_df[page_df['signal'] == 'POSITIVE']['page'].tolist()[:10]
+    top_negative = page_df[page_df['signal'] == 'NEGATIVE']['page'].tolist()[:10]
+    key_pages = top_positive + top_negative
+    
+    for page in key_pages:
+        # Users WITH this page
+        pos_with = sum(1 for _, r in pos_df.iterrows() if page in r['page_times'])
+        neg_with = sum(1 for _, r in neg_df.iterrows() if page in r['page_times'])
+        total_with = pos_with + neg_with
+        conv_with = pos_with / total_with * 100 if total_with > 0 else 0
+        
+        # Users WITHOUT this page
+        pos_without = len(pos_df) - pos_with
+        neg_without = len(neg_df) - neg_with
+        total_without = pos_without + neg_without
+        conv_without = pos_without / total_without * 100 if total_without > 0 else 0
+        
+        # Impact
+        impact = conv_with - conv_without
+        
+        # Time for users with this page
+        times_with = [r['page_times'].get(page, 0) for _, r in pos_df.iterrows() if page in r['page_times']]
+        times_with += [r['page_times'].get(page, 0) for _, r in neg_df.iterrows() if page in r['page_times']]
+        median_time = np.median(times_with) / 60 if times_with else 0
+        cum_time = sum(times_with) / 60
+        
+        results.append({
+            'page': page,
+            'users_with': total_with,
+            'conv_with_pct': round(conv_with, 1),
+            'users_without': total_without,
+            'conv_without_pct': round(conv_without, 1),
+            'impact_pct': round(impact, 1),
+            'median_time_min': round(median_time, 2),
+            'cum_time_hrs': round(cum_time / 60, 1),
+            'signal': 'POSITIVE' if impact > 5 else ('NEGATIVE' if impact < -5 else 'NEUTRAL')
+        })
+    
+    return sorted(results, key=lambda x: -x['impact_pct'])
+
+impact_df = pd.DataFrame(analyze_page_impact(pos_df, neg_df, page_df))
+
+print(f"\n{'Page':<30} | {'With':<8} | {'Conv%':<7} | {'Without':<8} | {'Conv%':<7} | {'Impact':<8} | {'Med Time':<10}")
+print("-"*105)
+
+for _, r in impact_df.iterrows():
+    impact_str = f"+{r['impact_pct']}" if r['impact_pct'] > 0 else f"{r['impact_pct']}"
+    print(f"{r['page'][:30]:<30} | {r['users_with']:<8} | {r['conv_with_pct']:<7} | {r['users_without']:<8} | {r['conv_without_pct']:<7} | {impact_str:<8} | {r['median_time_min']:<10}")
+
+# ============================================================================
+# REPORT 5: JOURNEY LENGTH BUCKETS WITH TIME
+# ============================================================================
+
+print("\n" + "="*70)
+print("REPORT 5: JOURNEY LENGTH & TIME BUCKETS")
+print("="*70)
+
+def analyze_length_buckets(quality_df):
+    """Analyze conversion by journey length and time buckets"""
+    
+    df = quality_df.copy()
+    
+    # Length buckets
+    df['length_bucket'] = pd.cut(df['unique_pages'], 
+                                  bins=[0, 5, 10, 15, 20, 30, 100],
+                                  labels=['1-5', '6-10', '11-15', '16-20', '21-30', '30+'])
+    
+    # Time buckets (in minutes)
+    df['time_bucket'] = pd.cut(df['total_time'] / 60,
+                                bins=[0, 2, 5, 10, 20, 60],
+                                labels=['0-2 min', '2-5 min', '5-10 min', '10-20 min', '20+ min'])
+    
+    # Length analysis
+    length_stats = df.groupby('length_bucket').agg({
+        'label': ['sum', 'count', 'mean'],
+        'total_time': ['sum', 'median']
+    }).reset_index()
+    length_stats.columns = ['bucket', 'conversions', 'users', 'conv_rate', 'cum_time', 'median_time']
+    length_stats['cum_time_hrs'] = length_stats['cum_time'] / 3600
+    length_stats['median_time_min'] = length_stats['median_time'] / 60
+    length_stats['conv_rate_pct'] = length_stats['conv_rate'] * 100
+    
+    print("\nBy Journey Length:")
+    print(f"{'Length':<12} | {'Users':<10} | {'Conversions':<12} | {'Conv %':<8} | {'Cum Time (hrs)':<15} | {'Med Time (min)':<15}")
+    print("-"*85)
+    for _, r in length_stats.iterrows():
+        print(f"{r['bucket']:<12} | {r['users']:<10.0f} | {r['conversions']:<12.0f} | {r['conv_rate_pct']:<8.1f} | {r['cum_time_hrs']:<15.0f} | {r['median_time_min']:<15.1f}")
+    
+    # Time analysis
+    time_stats = df.groupby('time_bucket').agg({
+        'label': ['sum', 'count', 'mean'],
+        'unique_pages': ['sum', 'median']
+    }).reset_index()
+    time_stats.columns = ['bucket', 'conversions', 'users', 'conv_rate', 'cum_pages', 'median_pages']
+    time_stats['conv_rate_pct'] = time_stats['conv_rate'] * 100
+    
+    print("\nBy Total Time:")
+    print(f"{'Time':<12} | {'Users':<10} | {'Conversions':<12} | {'Conv %':<8} | {'Cum Pages':<12} | {'Med Pages':<12}")
+    print("-"*75)
+    for _, r in time_stats.iterrows():
+        print(f"{r['bucket']:<12} | {r['users']:<10.0f} | {r['conversions']:<12.0f} | {r['conv_rate_pct']:<8.1f} | {r['cum_pages']:<12.0f} | {r['median_pages']:<12.0f}")
+    
+    return length_stats, time_stats
+
+length_stats, time_stats = analyze_length_buckets(quality_df)
+
+# ============================================================================
+# SAVE ALL REPORTS
+# ============================================================================
+
+print("\n" + "="*70)
+print("SAVING REPORTS")
+print("="*70)
+
+page_df.to_csv(f'{DATA_DIR}report_pages_{MODEL_NAME}.csv', index=False)
+sets_df.to_csv(f'{DATA_DIR}report_page_sets_{MODEL_NAME}.csv', index=False)
+profile_df.to_csv(f'{DATA_DIR}report_journey_profile_{MODEL_NAME}.csv', index=False)
+impact_df.to_csv(f'{DATA_DIR}report_page_impact_{MODEL_NAME}.csv', index=False)
+pd.DataFrame(length_stats).to_csv(f'{DATA_DIR}report_length_buckets_{MODEL_NAME}.csv', index=False)
+pd.DataFrame(time_stats).to_csv(f'{DATA_DIR}report_time_buckets_{MODEL_NAME}.csv', index=False)
+
+print(f"✓ report_pages_{MODEL_NAME}.csv ({len(page_df)} rows)")
+print(f"✓ report_page_sets_{MODEL_NAME}.csv ({len(sets_df)} rows)")
+print(f"✓ report_journey_profile_{MODEL_NAME}.csv")
+print(f"✓ report_page_impact_{MODEL_NAME}.csv ({len(impact_df)} rows)")
+print(f"✓ report_length_buckets_{MODEL_NAME}.csv")
+print(f"✓ report_time_buckets_{MODEL_NAME}.csv")
+
+# ============================================================================
+# VISUALIZATIONS
+# ============================================================================
+
+print("\n" + "="*70)
+print("CREATING VISUALIZATIONS")
+print("="*70)
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+# 1. Page Presence Lift (Top 15)
+ax1 = axes[0, 0]
+top_pages = page_df.head(15)
+colors = ['green' if x > 1.3 else ('red' if x < 0.7 else 'gray') for x in top_pages['presence_lift']]
+ax1.barh(range(len(top_pages)), top_pages['presence_lift'], color=colors)
+ax1.set_yticks(range(len(top_pages)))
+ax1.set_yticklabels(top_pages['page'].str[:25], fontsize=8)
+ax1.invert_yaxis()
+ax1.axvline(x=1.0, color='black', linestyle='--', alpha=0.5)
+ax1.set_xlabel('Presence Lift (Completers / Non-Completers)')
+ax1.set_title('Top Pages by Presence Lift')
+
+# 2. Cumulative Time by Page (Top 15)
+ax2 = axes[0, 1]
+x = np.arange(len(top_pages))
+width = 0.35
+ax2.bar(x - width/2, top_pages['pos_cum_time_min'], width, label='Completers', color='green', alpha=0.7)
+ax2.bar(x + width/2, top_pages['neg_cum_time_min'], width, label='Non-Completers', color='red', alpha=0.7)
+ax2.set_xticks(x)
+ax2.set_xticklabels(top_pages['page'].str[:15], rotation=45, ha='right', fontsize=7)
+ax2.set_ylabel('Cumulative Time (min)')
+ax2.set_title('Cumulative Time by Page')
+ax2.legend()
+
+# 3. Conversion by Journey Length
+ax3 = axes[0, 2]
+ax3.bar(length_stats['bucket'].astype(str), length_stats['conv_rate_pct'], color='steelblue', edgecolor='black')
+ax3.set_xlabel('Journey Length (Pages)')
+ax3.set_ylabel('Conversion Rate (%)')
+ax3.set_title('Conversion by Journey Length')
+for i, (bucket, rate, users) in enumerate(zip(length_stats['bucket'], length_stats['conv_rate_pct'], length_stats['users'])):
+    ax3.text(i, rate + 1, f'n={int(users):,}', ha='center', fontsize=8)
+
+# 4. Conversion by Time
+ax4 = axes[1, 0]
+ax4.bar(time_stats['bucket'].astype(str), time_stats['conv_rate_pct'], color='coral', edgecolor='black')
+ax4.set_xlabel('Total Journey Time')
+ax4.set_ylabel('Conversion Rate (%)')
+ax4.set_title('Conversion by Total Time')
+for i, (bucket, rate, users) in enumerate(zip(time_stats['bucket'], time_stats['conv_rate_pct'], time_stats['users'])):
+    ax4.text(i, rate + 1, f'n={int(users):,}', ha='center', fontsize=8)
+
+# 5. Page Impact
+ax5 = axes[1, 1]
+impact_sorted = impact_df.sort_values('impact_pct', ascending=True)
+colors = ['green' if x > 0 else 'red' for x in impact_sorted['impact_pct']]
+ax5.barh(range(len(impact_sorted)), impact_sorted['impact_pct'], color=colors)
+ax5.set_yticks(range(len(impact_sorted)))
+ax5.set_yticklabels(impact_sorted['page'].str[:25], fontsize=8)
+ax5.axvline(x=0, color='black', linestyle='-', alpha=0.5)
+ax5.set_xlabel('Conversion Impact (%)')
+ax5.set_title('Page Impact on Conversion\n(With Page vs Without Page)')
+
+# 6. Journey Profile Comparison
+ax6 = axes[1, 2]
+metrics = ['Unique Pages', 'Total Time (min)', 'Time per Page', 'Velocity']
+pos_vals = [pos_df['unique_pages'].median(), 
+            pos_df['total_time'].median()/60,
+            (pos_df['total_time']/60 / pos_df['unique_pages']).median(),
+            (pos_df['unique_pages'] / (pos_df['total_time']/60)).median()]
+neg_vals = [neg_df['unique_pages'].median(),
+            neg_df['total_time'].median()/60,
+            (neg_df['total_time']/60 / neg_df['unique_pages']).median(),
+            (neg_df['unique_pages'] / (neg_df['total_time']/60)).median()]
+
+x = np.arange(len(metrics))
+width = 0.35
+ax6.bar(x - width/2, pos_vals, width, label='Completers', color='green', alpha=0.7)
+ax6.bar(x + width/2, neg_vals, width, label='Non-Completers', color='red', alpha=0.7)
+ax6.set_xticks(x)
+ax6.set_xticklabels(metrics, rotation=15, ha='right')
+ax6.set_title('Journey Profile Comparison')
+ax6.legend()
+
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}journey_analysis_complete_{MODEL_NAME}.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved: journey_analysis_complete_{MODEL_NAME}.png")
+
+# ============================================================================
+# EXECUTIVE SUMMARY
+# ============================================================================
+
+print("\n" + "="*70)
+print("EXECUTIVE SUMMARY")
+print("="*70)
+
+print(f"""
+DATASET:
+├── Total Quality Users: {len(quality_df):,}
+├── Completers: {len(pos_df):,} ({len(pos_df)/len(quality_df)*100:.1f}%)
+└── Non-Completers: {len(neg_df):,} ({len(neg_df)/len(quality_df)*100:.1f}%)
+
+KEY FINDINGS:
+
+1. JOURNEY LENGTH:
+   ├── Completers visit {pos_df['unique_pages'].median():.0f} pages (median)
+   ├── Non-Completers visit {neg_df['unique_pages'].median():.0f} pages (median)
+   └── Difference: {((pos_df['unique_pages'].median() - neg_df['unique_pages'].median()) / neg_df['unique_pages'].median() * 100):.0f}% more pages
+
+2. TIME INVESTMENT:
+   ├── Completers spend {pos_df['total_time'].median()/60:.1f} min (median)
+   ├── Non-Completers spend {neg_df['total_time'].median()/60:.1f} min (median)
+   └── Difference: {((pos_df['total_time'].median() - neg_df['total_time'].median()) / neg_df['total_time'].median() * 100):.0f}% more time
+
+3. TOP POSITIVE SIGNALS (Pages with highest lift):
+""")
+
+for _, r in page_df[page_df['signal'] == 'POSITIVE'].head(5).iterrows():
+    print(f"   ├── {r['page']}: {r['presence_lift']:.2f}x lift, {r['conversion_rate']:.0f}% conversion")
+
+print(f"""
+4. TOP NEGATIVE SIGNALS (Pages with lowest lift):
+""")
+
+for _, r in page_df[page_df['signal'] == 'NEGATIVE'].head(5).iterrows():
+    print(f"   ├── {r['page']}: {r['presence_lift']:.2f}x lift, {r['conversion_rate']:.0f}% conversion")
+
+print(f"""
+5. RECOMMENDED ACTIONS:
+   ├── Promote pages with high positive lift
+   ├── Fix/remove friction on negative signal pages
+   ├── Target users with {pos_df['unique_pages'].median():.0f}+ pages and {pos_df['total_time'].median()/60:.0f}+ min
+   └── Intervene early for users with low engagement velocity
+
+FILES CREATED:
+├── report_pages_{MODEL_NAME}.csv
+├── report_page_sets_{MODEL_NAME}.csv
+├── report_journey_profile_{MODEL_NAME}.csv
+├── report_page_impact_{MODEL_NAME}.csv
+├── report_length_buckets_{MODEL_NAME}.csv
+├── report_time_buckets_{MODEL_NAME}.csv
+└── journey_analysis_complete_{MODEL_NAME}.png
+
+✓ ANALYSIS COMPLETE
+""")
