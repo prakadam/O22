@@ -1,0 +1,262 @@
+# ============================================================================
+# CLEAN JOURNEY ANALYSIS — MEANINGFUL DATA ONLY
+# ============================================================================
+
+import pandas as pd
+import numpy as np
+from collections import Counter
+from prefixspan import PrefixSpan
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# ============================================================================
+# LOAD FULL DATA (not just test)
+# ============================================================================
+
+# Load all splits
+train_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_train.parquet')
+val_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_val.parquet')
+test_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+
+# Combine
+full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+
+with open(f'{DATA_DIR}page_vocab_{MODEL_NAME}.json', 'r') as f:
+    page_vocab = json.load(f)
+id_to_page = {v: k for k, v in page_vocab.items()}
+
+print(f"Full dataset: {len(full_df):,} users")
+
+# ============================================================================
+# EXTRACT JOURNEYS WITH TIME FILTERING
+# ============================================================================
+
+MIN_TIME_PER_PAGE = 10    # Minimum 10 seconds (filter noise)
+MIN_JOURNEY_LENGTH = 10   # At least 10 pages
+MIN_TOTAL_TIME = 60       # At least 1 minute total journey
+
+def extract_journey_clean(row, id_to_page):
+    """Extract journey with quality filters"""
+    page_ids = row['page_ids']
+    time_deltas = row['time_deltas']
+    
+    if page_ids is None or len(page_ids) == 0:
+        return [], [], 0
+    
+    page_times = {}
+    page_first_pos = {}
+    
+    for i, (pid, time) in enumerate(zip(page_ids, time_deltas)):
+        if pid == 0:
+            continue
+        
+        page = id_to_page.get(pid, 'UNK')
+        time_val = float(time or 0)
+        
+        if page in page_times:
+            page_times[page] += time_val
+        else:
+            page_times[page] = time_val
+            page_first_pos[page] = i
+    
+    # Sort by first occurrence
+    sorted_pages = sorted(page_times.keys(), key=lambda p: page_first_pos[p])
+    times = [page_times[p] for p in sorted_pages]
+    total_time = sum(times)
+    
+    return sorted_pages, times, total_time
+
+# Apply
+full_df['pages'], full_df['times'], full_df['total_time'] = zip(
+    *full_df.apply(lambda row: extract_journey_clean(row, id_to_page), axis=1)
+)
+full_df['journey_length'] = full_df['pages'].apply(len)
+
+print(f"Extracted journeys")
+
+# ============================================================================
+# FILTER: TOP 50% QUALITY JOURNEYS
+# ============================================================================
+
+# Calculate percentiles
+time_p50 = full_df['total_time'].quantile(0.50)
+time_p90 = full_df['total_time'].quantile(0.90)
+len_p50 = full_df['journey_length'].quantile(0.50)
+
+print(f"\nJourney Stats (All Users):")
+print(f"  Time P50: {time_p50/60:.1f} min")
+print(f"  Time P90: {time_p90/60:.1f} min")
+print(f"  Length P50: {len_p50:.0f} pages")
+
+# Filter criteria for quality journeys:
+# 1. Total time >= 1 minute
+# 2. Journey length >= 10 pages
+# 3. Total time <= P90 (remove outliers)
+
+quality_df = full_df[
+    (full_df['total_time'] >= MIN_TOTAL_TIME) &
+    (full_df['journey_length'] >= MIN_JOURNEY_LENGTH) &
+    (full_df['total_time'] <= time_p90)
+].copy()
+
+print(f"\nQuality Journeys: {len(quality_df):,} ({len(quality_df)/len(full_df)*100:.0f}% of total)")
+
+# Split by outcome
+pos_df = quality_df[quality_df['label'] == 1]
+neg_df = quality_df[quality_df['label'] == 0]
+
+print(f"  Positive (completers): {len(pos_df):,}")
+print(f"  Negative (non-completers): {len(neg_df):,}")
+
+# ============================================================================
+# TIME CLEANING: Use Median, Remove Low Times
+# ============================================================================
+
+def clean_times(pages, times, min_time=10):
+    """Replace low times with median of valid times"""
+    valid_times = [t for t in times if t >= min_time]
+    
+    if not valid_times:
+        return times  # Can't fix
+    
+    median_time = np.median(valid_times)
+    
+    # Replace low times with median
+    cleaned = [t if t >= min_time else median_time for t in times]
+    return cleaned
+
+pos_df['times_clean'] = pos_df.apply(lambda r: clean_times(r['pages'], r['times']), axis=1)
+neg_df['times_clean'] = neg_df.apply(lambda r: clean_times(r['pages'], r['times']), axis=1)
+
+# ============================================================================
+# PREFIXSPAN WITH QUALITY DATA
+# ============================================================================
+
+def get_quality_patterns(df, min_support_pct=0.01, min_len=10, max_len=50):
+    """Extract patterns from quality journeys only"""
+    
+    sequences = df['pages'].tolist()
+    times_list = df['times_clean'].tolist()
+    
+    # Filter by minimum length
+    valid = [(s, t) for s, t in zip(sequences, times_list) if len(s) >= min_len]
+    sequences = [v[0] for v in valid]
+    times_list = [v[1] for v in valid]
+    
+    if len(sequences) < 10:
+        print("Not enough sequences")
+        return []
+    
+    print(f"Mining {len(sequences)} sequences...")
+    
+    ps = PrefixSpan(sequences)
+    ps.minlen = min_len
+    ps.maxlen = max_len
+    
+    min_support = max(int(len(sequences) * min_support_pct), 5)
+    patterns = ps.frequent(min_support)
+    
+    print(f"Found {len(patterns)} raw patterns")
+    
+    # Calculate stats with cleaned times
+    pattern_stats = []
+    for support, pattern in patterns:
+        if len(pattern) < min_len:
+            continue
+            
+        matching_times = []
+        for seq, times in zip(sequences, times_list):
+            try:
+                # Find pattern in sequence
+                pat_str = '→'.join(pattern)
+                seq_str = '→'.join(seq)
+                if pat_str in seq_str:
+                    idx = seq.index(pattern[0])
+                    end = min(idx + len(pattern), len(times))
+                    total = sum(times[idx:end])
+                    if total > 0:  # Only valid times
+                        matching_times.append(total)
+            except:
+                continue
+        
+        if matching_times and len(matching_times) >= 3:
+            pattern_stats.append({
+                'pattern': ' → '.join(pattern),
+                'length': len(pattern),
+                'users': support,
+                'avg_time_min': round(np.mean(matching_times) / 60, 1),
+                'median_time_min': round(np.median(matching_times) / 60, 1),
+                'time_per_step': round(np.mean(matching_times) / len(pattern) / 60, 2),
+                'p10_time': round(np.percentile(matching_times, 10) / 60, 1),
+                'p90_time': round(np.percentile(matching_times, 90) / 60, 1)
+            })
+    
+    # Sort by length (longer = more meaningful), then users
+    return sorted(pattern_stats, key=lambda x: (-x['length'], -x['users']))
+
+print("\n" + "="*70)
+print("EXTRACTING QUALITY PATTERNS")
+print("="*70)
+
+pos_patterns = get_quality_patterns(pos_df, min_support_pct=0.01, min_len=10, max_len=50)
+neg_patterns = get_quality_patterns(neg_df, min_support_pct=0.01, min_len=10, max_len=50)
+
+print(f"\nQuality Positive Patterns: {len(pos_patterns)}")
+print(f"Quality Negative Patterns: {len(neg_patterns)}")
+
+# ============================================================================
+# DISPLAY MEANINGFUL RESULTS
+# ============================================================================
+
+print("\n" + "="*70)
+print("TOP 10 SUCCESSFUL JOURNEYS (Quality Data)")
+print("="*70)
+print(f"{'Length':<6} | {'Users':<6} | {'Median Time':<12} | {'Per Step':<10} | Pattern")
+print("-"*100)
+
+for p in pos_patterns[:10]:
+    print(f"{p['length']:<6} | {p['users']:<6} | {p['median_time_min']:<10} min | {p['time_per_step']:<8} min | {p['pattern'][:50]}...")
+
+print("\n" + "="*70)
+print("TOP 10 FAILED JOURNEYS (Quality Data)")
+print("="*70)
+print(f"{'Length':<6} | {'Users':<6} | {'Median Time':<12} | {'Per Step':<10} | Pattern")
+print("-"*100)
+
+for p in neg_patterns[:10]:
+    print(f"{p['length']:<6} | {p['users']:<6} | {p['median_time_min']:<10} min | {p['time_per_step']:<8} min | {p['pattern'][:50]}...")
+
+# ============================================================================
+# SAVE
+# ============================================================================
+
+pd.DataFrame(pos_patterns).to_csv(f'{DATA_DIR}quality_successful_journeys_{MODEL_NAME}.csv', index=False)
+pd.DataFrame(neg_patterns).to_csv(f'{DATA_DIR}quality_failed_journeys_{MODEL_NAME}.csv', index=False)
+
+print(f"\n✓ Saved: quality_successful_journeys_{MODEL_NAME}.csv")
+print(f"✓ Saved: quality_failed_journeys_{MODEL_NAME}.csv")
+```
+
+---
+
+## What Changed
+
+| Before | After |
+|--------|-------|
+| Test data only | Full dataset (train + val + test) |
+| All journeys | Top 50% quality (filtered) |
+| Raw times (0.0 min) | Cleaned times (median replacement) |
+| Any length | Minimum 10 pages |
+| Avg time | Median time (more robust) |
+| Short patterns | Minimum 10-step patterns |
+
+---
+
+## Quality Filters Applied
+```
+1. Total journey time >= 1 minute
+2. Journey length >= 10 pages
+3. Total time <= 90th percentile (remove outliers)
+4. Per-page time >= 10 seconds (or replace with median)
+5. Pattern length >= 10 steps
