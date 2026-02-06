@@ -382,3 +382,47 @@ results_df = pd.DataFrame(results).sort_values('lift', ascending=False)
 results_df.to_csv(f'{DATA_DIR}set_analysis_{MODEL_NAME}.csv', index=False)
 
 print(f"✓ Saved: set_analysis_{MODEL_NAME}.csv ({len(results_df)} sets with 5+ users)")
+
+
+
+# ============================================================================
+# DEBUG: TIME CALCULATION
+# ============================================================================
+
+print("="*70)
+print("DEBUG: TIME VALUES")
+print("="*70)
+
+# Check raw time_deltas
+sample = full_df.iloc[0]
+print(f"Sample time_deltas type: {type(sample['time_deltas'])}")
+print(f"Sample time_deltas length: {len(sample['time_deltas'])}")
+print(f"Sample time_deltas first 10: {sample['time_deltas'][:10]}")
+print(f"Sample time_deltas sum: {sum(sample['time_deltas'])}")
+
+# Check distribution
+print(f"\n--- TOTAL TIME DISTRIBUTION ---")
+print(f"Min: {full_df['total_time'].min()}")
+print(f"Max: {full_df['total_time'].max()}")
+print(f"Median: {full_df['total_time'].median()}")
+print(f"Mean: {full_df['total_time'].mean()}")
+
+# Check units — is it seconds, milliseconds, or already minutes?
+print(f"\n--- LIKELY UNIT ---")
+print(f"If seconds: Median = {full_df['total_time'].median()/60:.1f} min")
+print(f"If milliseconds: Median = {full_df['total_time'].median()/60000:.1f} min")
+print(f"If already minutes: Median = {full_df['total_time'].median():.1f} min")
+
+# Check zeros
+print(f"\n--- ZERO/NULL CHECK ---")
+print(f"Users with total_time = 0: {(full_df['total_time'] == 0).sum():,}")
+print(f"Users with total_time < 1: {(full_df['total_time'] < 1).sum():,}")
+print(f"Users with total_time < 60: {(full_df['total_time'] < 60).sum():,}")
+
+# Check a few rows
+print(f"\n--- SAMPLE ROWS ---")
+for i in [0, 100, 1000]:
+    row = full_df.iloc[i]
+    times = row['time_deltas']
+    non_zero = [t for t in times if t > 0]
+    print(f"Row {i}: sum={sum(times):.2f}, non_zero={len(non_zero)}, max={max(times) if times else 0:.2f}")
