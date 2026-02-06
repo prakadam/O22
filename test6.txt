@@ -174,3 +174,116 @@ Labels:
   Negative: {(1-full_df['label']).sum():,}
   Conversion: {full_df['label'].mean()*100:.1f}%
 """)
+
+
+# ============================================================================
+# CHECK SET FREQUENCY (How many users per set)
+# ============================================================================
+
+from collections import Counter
+
+# Count users per set
+set_counts = Counter(full_df['page_set'].tolist())
+
+print("="*70)
+print("SET FREQUENCY DISTRIBUTION")
+print("="*70)
+
+print(f"Total unique sets: {len(set_counts):,}")
+
+# Distribution
+freq_dist = Counter(set_counts.values())
+print(f"\nSets with 1 user: {freq_dist[1]:,}")
+print(f"Sets with 2-5 users: {sum(v for k,v in freq_dist.items() if 2<=k<=5):,}")
+print(f"Sets with 6-10 users: {sum(v for k,v in freq_dist.items() if 6<=k<=10):,}")
+print(f"Sets with 11-20 users: {sum(v for k,v in freq_dist.items() if 11<=k<=20):,}")
+print(f"Sets with 20+ users: {sum(v for k,v in freq_dist.items() if k>20):,}")
+
+# Top sets
+print(f"\nTop 10 most common sets:")
+for page_set, count in set_counts.most_common(10):
+    pages = sorted(list(page_set))
+    print(f"  {count:>5} users | {len(pages):>2} pages | {', '.join(pages[:5])}{'...' if len(pages)>5 else ''}")
+
+# Sets with MIN_USERS (20)
+sets_with_min = sum(1 for c in set_counts.values() if c >= 20)
+print(f"\nSets with 20+ users: {sets_with_min:,}")
+
+
+# ============================================================================
+# BETTER APPROACH: PAGE PRESENCE MATRIX
+# ============================================================================
+
+print("="*70)
+print("PAGE PRESENCE ANALYSIS (Binary: visited or not)")
+print("="*70)
+
+# Create binary presence matrix (user × page)
+all_pages = sorted(list(id_to_page.values()))
+print(f"Total unique pages: {len(all_pages)}")
+
+# For each page, count users who visited
+page_presence = {}
+for page in all_pages:
+    has_page = full_df['page_set'].apply(lambda s: page in s)
+    
+    pos_has = has_page[full_df['label'] == 1].sum()
+    neg_has = has_page[full_df['label'] == 0].sum()
+    
+    total_pos = full_df['label'].sum()
+    total_neg = (1 - full_df['label']).sum()
+    
+    page_presence[page] = {
+        'page': page,
+        'pos_users': pos_has,
+        'neg_users': neg_has,
+        'pos_pct': round(pos_has / total_pos * 100, 1),
+        'neg_pct': round(neg_has / total_neg * 100, 1),
+        'lift': round((pos_has/total_pos) / (neg_has/total_neg), 2) if neg_has > 0 else 5.0,
+        'total_users': pos_has + neg_has
+    }
+
+# Convert to dataframe
+presence_df = pd.DataFrame(page_presence.values())
+presence_df = presence_df.sort_values('lift', ascending=False)
+
+print(f"\n{'Page':<40} | {'Pos %':<8} | {'Neg %':<8} | {'Lift':<8} | Users")
+print("-"*80)
+
+print("\nTOP 15 POSITIVE SIGNALS (High Lift):")
+for _, r in presence_df.head(15).iterrows():
+    print(f"{r['page'][:40]:<40} | {r['pos_pct']:<8} | {r['neg_pct']:<8} | {r['lift']:<8}x | {r['total_users']}")
+
+print("\nTOP 15 NEGATIVE SIGNALS (Low Lift):")
+for _, r in presence_df.tail(15).iterrows():
+    print(f"{r['page'][:40]:<40} | {r['pos_pct']:<8} | {r['neg_pct']:<8} | {r['lift']:<8}x | {r['total_users']}")
+
+presence_df.to_csv(f'{DATA_DIR}page_presence_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved: page_presence_{MODEL_NAME}.csv ({len(presence_df)} pages)")
+
+# ============================================================================
+# SET SIZE ANALYSIS (Instead of exact sets)
+# ============================================================================
+
+print("\n" + "="*70)
+print("SET SIZE ANALYSIS (How many pages visited)")
+print("="*70)
+
+full_df['set_size'] = full_df['page_set'].apply(len)
+
+# Group by set size
+size_stats = full_df.groupby('set_size').agg({
+    'label': ['sum', 'count', 'mean'],
+    'total_time': 'median'
+}).reset_index()
+size_stats.columns = ['set_size', 'conversions', 'users', 'conv_rate', 'median_time']
+size_stats['conv_pct'] = (size_stats['conv_rate'] * 100).round(1)
+size_stats['median_time_min'] = (size_stats['median_time'] / 60).round(1)
+
+print(f"\n{'Pages':<8} | {'Users':<10} | {'Conversions':<12} | {'Conv %':<8} | {'Med Time'}")
+print("-"*60)
+for _, r in size_stats.head(30).iterrows():
+    print(f"{r['set_size']:<8} | {r['users']:<10} | {r['conversions']:<12.0f} | {r['conv_pct']:<8} | {r['median_time_min']} min")
+
+size_stats.to_csv(f'{DATA_DIR}set_size_analysis_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved: set_size_analysis_{MODEL_NAME}.csv")
