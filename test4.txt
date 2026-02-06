@@ -260,3 +260,125 @@ print(f"✓ Saved: quality_failed_journeys_{MODEL_NAME}.csv")
 3. Total time <= 90th percentile (remove outliers)
 4. Per-page time >= 10 seconds (or replace with median)
 5. Pattern length >= 10 steps
+
+
+# ============================================================================
+# CHECK SET FREQUENCY (With Time, Sequence Length & Conversion)
+# ============================================================================
+from collections import Counter, defaultdict
+import numpy as np
+
+# Calculate fields if not already done
+if 'total_time' not in full_df.columns:
+    full_df['total_time'] = full_df['time_deltas'].apply(lambda x: sum(x) if x is not None else 0)
+
+if 'actual_seq_len' not in full_df.columns:
+    full_df['actual_seq_len'] = full_df['page_ids'].apply(lambda x: sum(1 for p in x if p != 0))
+
+# Count users per set + aggregate stats
+set_stats = defaultdict(lambda: {'count': 0, 'times': [], 'seq_lens': [], 'labels': []})
+
+for _, row in full_df.iterrows():
+    key = row['page_set']
+    set_stats[key]['count'] += 1
+    set_stats[key]['times'].append(row['total_time'])
+    set_stats[key]['seq_lens'].append(row['actual_seq_len'])
+    set_stats[key]['labels'].append(row['label'])
+
+# Overall conversion rate (for lift calculation)
+overall_conv = full_df['label'].mean()
+
+print("="*70)
+print("SET FREQUENCY DISTRIBUTION (With Time, SeqLen & Conversion)")
+print("="*70)
+
+print(f"Total unique sets: {len(set_stats):,}")
+print(f"Overall conversion rate: {overall_conv*100:.1f}%")
+
+# Distribution
+freq_dist = Counter(s['count'] for s in set_stats.values())
+print(f"\nSets with 1 user: {freq_dist[1]:,}")
+print(f"Sets with 2-5 users: {sum(v for k,v in freq_dist.items() if 2<=k<=5):,}")
+print(f"Sets with 6-10 users: {sum(v for k,v in freq_dist.items() if 6<=k<=10):,}")
+print(f"Sets with 11-20 users: {sum(v for k,v in freq_dist.items() if 11<=k<=20):,}")
+print(f"Sets with 20+ users: {sum(v for k,v in freq_dist.items() if k>20):,}")
+
+# Top sets
+print(f"\nTop 15 most common sets:")
+print(f"{'Users':>6} | {'Pages':>5} | {'Time':>8} | {'SeqLen':>7} | {'Conv%':>6} | {'Lift':>5} | Pages")
+print("-"*100)
+
+top_sets = sorted(set_stats.items(), key=lambda x: -x[1]['count'])[:15]
+for page_set, stats in top_sets:
+    pages = sorted(list(page_set))
+    med_time = np.median(stats['times']) / 60
+    med_seq = np.median(stats['seq_lens'])
+    conv_rate = np.mean(stats['labels'])
+    lift = conv_rate / overall_conv if overall_conv > 0 else 0
+    
+    print(f"{stats['count']:>6} | {len(pages):>5} | {med_time:>6.1f}m | {med_seq:>7.0f} | {conv_rate*100:>5.1f}% | {lift:>5.2f}x | {', '.join(pages[:3])}{'...' if len(pages)>3 else ''}")
+
+# High converting sets (20+ users)
+print(f"\n" + "="*70)
+print("TOP 15 HIGH CONVERTING SETS (20+ users, sorted by lift)")
+print("="*70)
+print(f"{'Users':>6} | {'Pages':>5} | {'Time':>8} | {'SeqLen':>7} | {'Conv%':>6} | {'Lift':>5} | Pages")
+print("-"*100)
+
+# Filter and sort by conversion
+high_conv_sets = [(k, v) for k, v in set_stats.items() if v['count'] >= 20]
+high_conv_sets = sorted(high_conv_sets, key=lambda x: -np.mean(x[1]['labels']))[:15]
+
+for page_set, stats in high_conv_sets:
+    pages = sorted(list(page_set))
+    med_time = np.median(stats['times']) / 60
+    med_seq = np.median(stats['seq_lens'])
+    conv_rate = np.mean(stats['labels'])
+    lift = conv_rate / overall_conv if overall_conv > 0 else 0
+    
+    print(f"{stats['count']:>6} | {len(pages):>5} | {med_time:>6.1f}m | {med_seq:>7.0f} | {conv_rate*100:>5.1f}% | {lift:>5.2f}x | {', '.join(pages[:3])}{'...' if len(pages)>3 else ''}")
+
+# Low converting sets (dropout signals)
+print(f"\n" + "="*70)
+print("TOP 15 LOW CONVERTING SETS (20+ users, dropout signals)")
+print("="*70)
+print(f"{'Users':>6} | {'Pages':>5} | {'Time':>8} | {'SeqLen':>7} | {'Conv%':>6} | {'Lift':>5} | Pages")
+print("-"*100)
+
+low_conv_sets = [(k, v) for k, v in set_stats.items() if v['count'] >= 20]
+low_conv_sets = sorted(low_conv_sets, key=lambda x: np.mean(x[1]['labels']))[:15]
+
+for page_set, stats in low_conv_sets:
+    pages = sorted(list(page_set))
+    med_time = np.median(stats['times']) / 60
+    med_seq = np.median(stats['seq_lens'])
+    conv_rate = np.mean(stats['labels'])
+    lift = conv_rate / overall_conv if overall_conv > 0 else 0
+    
+    print(f"{stats['count']:>6} | {len(pages):>5} | {med_time:>6.1f}m | {med_seq:>7.0f} | {conv_rate*100:>5.1f}% | {lift:>5.2f}x | {', '.join(pages[:3])}{'...' if len(pages)>3 else ''}")
+
+# Save to CSV
+print(f"\n" + "="*70)
+print("SAVING RESULTS")
+print("="*70)
+
+results = []
+for page_set, stats in set_stats.items():
+    if stats['count'] >= 5:  # At least 5 users
+        pages = sorted(list(page_set))
+        conv_rate = np.mean(stats['labels'])
+        results.append({
+            'page_set': ' | '.join(pages),
+            'num_pages': len(pages),
+            'users': stats['count'],
+            'median_time_min': round(np.median(stats['times']) / 60, 1),
+            'median_seq_len': int(np.median(stats['seq_lens'])),
+            'conversions': sum(stats['labels']),
+            'conv_rate_pct': round(conv_rate * 100, 1),
+            'lift': round(conv_rate / overall_conv, 2) if overall_conv > 0 else 0
+        })
+
+results_df = pd.DataFrame(results).sort_values('lift', ascending=False)
+results_df.to_csv(f'{DATA_DIR}set_analysis_{MODEL_NAME}.csv', index=False)
+
+print(f"✓ Saved: set_analysis_{MODEL_NAME}.csv ({len(results_df)} sets with 5+ users)")
