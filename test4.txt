@@ -426,3 +426,65 @@ for i in [0, 100, 1000]:
     times = row['time_deltas']
     non_zero = [t for t in times if t > 0]
     print(f"Row {i}: sum={sum(times):.2f}, non_zero={len(non_zero)}, max={max(times) if times else 0:.2f}")
+
+
+
+# ============================================================================
+# DEBUG: FIND ROWS WITH PAGES BUT NO TIME
+# ============================================================================
+
+print("="*70)
+print("ROWS WITH 4-5 PAGES BUT 0 TIME")
+print("="*70)
+
+# Find problematic rows
+problem_rows = full_df[
+    (full_df['set_size'] >= 4) & 
+    (full_df['set_size'] <= 5) & 
+    (full_df['total_time'] == 0)
+]
+
+print(f"Total rows with 4-5 pages and 0 time: {len(problem_rows):,}")
+
+# Show first 10
+print(f"\nFirst 10 examples:")
+print(f"{'Index':<8} | {'Pages':<6} | {'SeqLen':<8} | {'Time':<8} | Page Set")
+print("-"*80)
+
+for idx, row in problem_rows.head(10).iterrows():
+    pages = sorted(list(row['page_set']))
+    print(f"{idx:<8} | {row['set_size']:<6} | {row['actual_seq_len']:<8} | {row['total_time']:<8.2f} | {', '.join(pages[:4])}")
+
+# Check time_deltas for these rows
+print(f"\n--- RAW TIME_DELTAS FOR THESE ROWS ---")
+for idx, row in problem_rows.head(5).iterrows():
+    times = row['time_deltas']
+    non_zero = sum(1 for t in times if t > 0)
+    print(f"\nRow {idx}:")
+    print(f"  time_deltas length: {len(times)}")
+    print(f"  non-zero count: {non_zero}")
+    print(f"  first 20 values: {times[:20]}")
+    print(f"  sum: {sum(times)}")
+
+# Also check rows WITH time for comparison
+print(f"\n" + "="*70)
+print("COMPARISON: ROWS WITH 4-5 PAGES AND TIME > 0")
+print("="*70)
+
+good_rows = full_df[
+    (full_df['set_size'] >= 4) & 
+    (full_df['set_size'] <= 5) & 
+    (full_df['total_time'] > 0)
+]
+
+print(f"Total rows with 4-5 pages and time > 0: {len(good_rows):,}")
+
+for idx, row in good_rows.head(5).iterrows():
+    times = row['time_deltas']
+    non_zero = sum(1 for t in times if t > 0)
+    print(f"\nRow {idx}:")
+    print(f"  total_time: {row['total_time']:.2f}")
+    print(f"  time_deltas length: {len(times)}")
+    print(f"  non-zero count: {non_zero}")
+    print(f"  first 20 values: {times[:20]}")
+    print(f"  sum: {sum(times)}")
