@@ -552,3 +552,35 @@ Visualizations:
 
 ✓ ALL REPORTS COMPLETE
 """)
+
+
+# ============================================================================
+# LIST PAGES FOR 64 MCIDs
+# ============================================================================
+
+import pandas as pd
+import json
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# Load data
+train_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_train.parquet')
+val_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_val.parquet')
+test_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+
+# Load vocab
+with open(f'{DATA_DIR}page_vocab_{MODEL_NAME}.json', 'r') as f:
+    page_vocab = json.load(f)
+id_to_page = {v: k for k, v in page_vocab.items()}
+
+print(f"Total users in data: {len(full_df):,}")
+print("="*70)
+
+# List all 64
+for _, row in full_df.iterrows():
+    mcid = row['mcid']
+    page_ids = row['page_ids']
+    pages = sorted(set([id_to_page.get(p, 'UNK') for p in page_ids if p != 0]))
+    print(f"{mcid} | {', '.join(pages)}")
