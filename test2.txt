@@ -58,4 +58,61 @@ time_deltas: [5,    10,   3,    8,   2,    15]
 
 AFTER (deduped anywhere, summed):
 pages: [HOME, PLAN, DCE, OLE]   ← Order by first occurrence
-times: [8,    12,   8,   15]    ← Summed (HOME: 5+3, PLAN: 10+2)
+times: [8,    12,   8,   15]    ← Summed (HOME: 5+3, PLAN: 10+2
+
+# ============================================================================
+# DEBUG: FIND MCIDs WITH PAGES BUT NO TIME
+# ============================================================================
+
+print("="*70)
+print("MCIDs WITH 4-5 PAGES BUT 0 TIME")
+print("="*70)
+
+# Find problematic rows
+problem_rows = full_df[
+    (full_df['set_size'] >= 4) & 
+    (full_df['set_size'] <= 5) & 
+    (full_df['total_time'] == 0)
+]
+
+print(f"Total rows with 4-5 pages and 0 time: {len(problem_rows):,}")
+
+# Show first 20 MCIDs
+print(f"\nFirst 20 MCIDs:")
+print(f"{'MCID':<40} | {'Pages':<6} | {'SeqLen':<8} | {'Time':<8} | Page Set")
+print("-"*100)
+
+for idx, row in problem_rows.head(20).iterrows():
+    pages = sorted(list(row['page_set']))
+    mcid = row['mcid'] if 'mcid' in row else idx
+    print(f"{str(mcid)[:40]:<40} | {row['set_size']:<6} | {row['actual_seq_len']:<8} | {row['total_time']:<8.2f} | {', '.join(pages[:3])}...")
+
+# Export full list
+print(f"\n--- EXPORTING FULL LIST ---")
+problem_mcids = problem_rows[['mcid', 'set_size', 'actual_seq_len', 'total_time', 'label']].copy()
+problem_mcids['page_set'] = problem_rows['page_set'].apply(lambda x: ' | '.join(sorted(list(x))))
+problem_mcids.to_csv(f'{DATA_DIR}debug_zero_time_mcids_{MODEL_NAME}.csv', index=False)
+print(f"✓ Saved: debug_zero_time_mcids_{MODEL_NAME}.csv ({len(problem_mcids)} rows)")
+
+# Also show MCIDs WITH time for comparison
+print(f"\n" + "="*70)
+print("COMPARISON: MCIDs WITH 4-5 PAGES AND TIME > 60 sec")
+print("="*70)
+
+good_rows = full_df[
+    (full_df['set_size'] >= 4) & 
+    (full_df['set_size'] <= 5) & 
+    (full_df['total_time'] > 60)
+]
+
+print(f"Total: {len(good_rows):,}")
+print(f"\nFirst 10 MCIDs:")
+print(f"{'MCID':<40} | {'Pages':<6} | {'SeqLen':<8} | {'Time (sec)':<10} | Page Set")
+print("-"*100)
+
+for idx, row in good_rows.head(10).iterrows():
+    pages = sorted(list(row['page_set']))
+    mcid = row['mcid'] if 'mcid' in row else idx
+    print(f"{str(mcid)[:40]:<40} | {row['set_size']:<6} | {row['actual_seq_len']:<8} | {row['total_time']:<10.1f} | {', '.join(pages[:3])}...")
+
+)
