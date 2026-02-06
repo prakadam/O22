@@ -1,0 +1,61 @@
+def extract_journey(row, id_to_page):
+    """Extract unique pages and sum their times (anywhere in journey)"""
+    page_ids = row['page_ids']
+    time_deltas = row['time_deltas']
+    
+    if not page_ids or len(page_ids) == 0:
+        return [], []
+    
+    # Aggregate time by page (anywhere)
+    page_times = {}
+    page_first_pos = {}
+    
+    for i, (pid, time) in enumerate(zip(page_ids, time_deltas)):
+        if pid == 0:  # Skip padding
+            continue
+        
+        page = id_to_page.get(pid, 'UNK')
+        
+        if page in page_times:
+            page_times[page] += float(time or 0)
+        else:
+            page_times[page] = float(time or 0)
+            page_first_pos[page] = i  # Track first occurrence
+    
+    # Sort by first occurrence (preserve journey order)
+    sorted_pages = sorted(page_times.keys(), key=lambda p: page_first_pos[p])
+    
+    pages = sorted_pages
+    times = [page_times[p] for p in sorted_pages]
+    
+    return pages, times
+
+# Load vocabulary
+with open(f'{DATA_DIR}page_vocab_{MODEL_NAME}.json', 'r') as f:
+    page_vocab = json.load(f)
+id_to_page = {v: k for k, v in page_vocab.items()}
+
+# Apply
+test_df['pages'], test_df['times'] = zip(*test_df.apply(lambda row: extract_journey(row, id_to_page), axis=1))
+test_df['journey_length'] = test_df['pages'].apply(len)
+test_df['total_time'] = test_df['times'].apply(sum)
+
+pos_df = test_df[test_df['actual'] == 1]
+neg_df = test_df[test_df['actual'] == 0]
+
+print(f"Positive: {len(pos_df)} | Negative: {len(neg_df)}")
+print(f"Sample journey: {pos_df['pages'].iloc[0][:5]}...")
+print(f"Sample times (summed): {pos_df['times'].iloc[0][:5]}...")
+```
+
+---
+
+**What it does:**
+```
+BEFORE (raw):
+page_ids:    [HOME, PLAN, HOME, DCE, PLAN, OLE]
+time_deltas: [5,    10,   3,    8,   2,    15]
+
+AFTER (deduped anywhere, summed):
+pages: [HOME, PLAN, DCE, OLE]   ← Order by first occurrence
+times: [8,    12,   8,   15]    ← Summed (HOME: 5+3, PLAN: 10+2)
