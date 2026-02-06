@@ -1,0 +1,176 @@
+# ============================================================================
+# DEBUG: STEP BY STEP DATA CHECK
+# ============================================================================
+
+import pandas as pd
+import numpy as np
+import json
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# ============================================================================
+# STEP 1: LOAD AND COUNT
+# ============================================================================
+
+print("="*70)
+print("STEP 1: LOAD DATA")
+print("="*70)
+
+train_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_train.parquet')
+val_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_val.parquet')
+test_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+
+print(f"Train: {len(train_df):,}")
+print(f"Val: {len(val_df):,}")
+print(f"Test: {len(test_df):,}")
+
+full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+print(f"Total: {len(full_df):,}")
+
+# ============================================================================
+# STEP 2: CHECK COLUMNS
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 2: COLUMNS")
+print("="*70)
+
+print(f"Columns: {full_df.columns.tolist()}")
+
+# ============================================================================
+# STEP 3: CHECK SAMPLE ROW
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 3: SAMPLE ROW")
+print("="*70)
+
+sample = full_df.iloc[0]
+print(f"page_ids type: {type(sample['page_ids'])}")
+print(f"page_ids length: {len(sample['page_ids'])}")
+print(f"page_ids first 10: {sample['page_ids'][:10]}")
+print(f"page_ids non-zero count: {sum(1 for p in sample['page_ids'] if p != 0)}")
+
+print(f"\ntime_deltas type: {type(sample['time_deltas'])}")
+print(f"time_deltas length: {len(sample['time_deltas'])}")
+print(f"time_deltas first 10: {sample['time_deltas'][:10]}")
+
+print(f"\nlabel: {sample['label']}")
+print(f"seq_len: {sample['seq_len']}")
+
+# ============================================================================
+# STEP 4: CHECK VOCAB
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 4: VOCABULARY")
+print("="*70)
+
+with open(f'{DATA_DIR}page_vocab_{MODEL_NAME}.json', 'r') as f:
+    page_vocab = json.load(f)
+
+print(f"Vocab size: {len(page_vocab)}")
+print(f"Sample pages: {list(page_vocab.keys())[:10]}")
+
+id_to_page = {v: k for k, v in page_vocab.items()}
+
+# ============================================================================
+# STEP 5: EXTRACT UNIQUE SETS
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 5: UNIQUE PAGE SETS")
+print("="*70)
+
+def get_page_set(row, id_to_page):
+    """Get unique pages as frozenset"""
+    page_ids = row['page_ids']
+    pages = set()
+    for pid in page_ids:
+        if pid != 0:
+            pages.add(id_to_page.get(pid, 'UNK'))
+    return frozenset(pages)
+
+# Get all unique sets
+full_df['page_set'] = full_df.apply(lambda r: get_page_set(r, id_to_page), axis=1)
+
+unique_sets = full_df['page_set'].nunique()
+print(f"Unique page sets: {unique_sets:,}")
+
+# ============================================================================
+# STEP 6: SET SIZE DISTRIBUTION
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 6: SET SIZE DISTRIBUTION")
+print("="*70)
+
+full_df['set_size'] = full_df['page_set'].apply(len)
+
+print(f"Min pages per user: {full_df['set_size'].min()}")
+print(f"Max pages per user: {full_df['set_size'].max()}")
+print(f"Median pages per user: {full_df['set_size'].median()}")
+print(f"Mean pages per user: {full_df['set_size'].mean():.1f}")
+
+print("\nDistribution:")
+print(full_df['set_size'].describe())
+
+# ============================================================================
+# STEP 7: LABEL DISTRIBUTION
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 7: LABEL DISTRIBUTION")
+print("="*70)
+
+print(full_df['label'].value_counts())
+print(f"\nConversion rate: {full_df['label'].mean()*100:.1f}%")
+
+# ============================================================================
+# STEP 8: TIME DISTRIBUTION
+# ============================================================================
+
+print("\n" + "="*70)
+print("STEP 8: TIME DISTRIBUTION")
+print("="*70)
+
+full_df['total_time'] = full_df['time_deltas'].apply(lambda x: sum(x) if x is not None else 0)
+
+print(f"Min total time: {full_df['total_time'].min()/60:.1f} min")
+print(f"Max total time: {full_df['total_time'].max()/60:.1f} min")
+print(f"Median total time: {full_df['total_time'].median()/60:.1f} min")
+print(f"Mean total time: {full_df['total_time'].mean()/60:.1f} min")
+
+print(f"\nUsers with 0 time: {(full_df['total_time'] == 0).sum():,}")
+print(f"Users with <1 min: {(full_df['total_time'] < 60).sum():,}")
+print(f"Users with <5 min: {(full_df['total_time'] < 300).sum():,}")
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+
+print("\n" + "="*70)
+print("SUMMARY")
+print("="*70)
+
+print(f"""
+Total Users: {len(full_df):,}
+Unique Page Sets: {unique_sets:,}
+Unique Pages (Vocab): {len(page_vocab)}
+
+Pages per User:
+  Min: {full_df['set_size'].min()}
+  Median: {full_df['set_size'].median():.0f}
+  Max: {full_df['set_size'].max()}
+
+Time per User:
+  Min: {full_df['total_time'].min()/60:.1f} min
+  Median: {full_df['total_time'].median()/60:.1f} min
+  Max: {full_df['total_time'].max()/60:.1f} min
+
+Labels:
+  Positive: {full_df['label'].sum():,}
+  Negative: {(1-full_df['label']).sum():,}
+  Conversion: {full_df['label'].mean()*100:.1f}%
+""")
