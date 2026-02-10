@@ -1,0 +1,539 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Journey Analysis — Pre-OLE (v5)
+# MAGIC
+# MAGIC ### Structure
+# MAGIC - Every report produces **two separate tables**: one for Completers, one for Non-Completers
+# MAGIC - No combined/mixed stats
+# MAGIC - Metrics: unique pages, total visits, cumulative time, time per page, time per visit
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Setup
+
+# COMMAND ----------
+
+import pandas as pd
+import numpy as np
+import json, pickle
+from collections import defaultdict, Counter
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# Load and combine all splits
+train_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_train.parquet')
+val_df   = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_val.parquet')
+test_df  = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+full_df  = pd.concat([train_df, val_df, test_df], ignore_index=True)
+del train_df, val_df, test_df  # free memory
+
+# Page vocabulary: numeric ID → page name
+with open(f'{DATA_DIR}page_vocab_{MODEL_NAME}.json', 'r') as f:
+    page_vocab = json.load(f)
+id_to_page = {v: k for k, v in page_vocab.items()}
+
+print(f"Total users: {len(full_df):,}")
+print(f"  Completers:     {full_df['label'].sum():,}")
+print(f"  Non-completers: {(full_df['label'] == 0).sum():,}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verification: Do pages repeat in raw data?
+
+# COMMAND ----------
+
+repeat_count = 0
+no_repeat_count = 0
+examples = []
+
+for idx in range(min(1000, len(full_df))):
+    raw_pids = [p for p in full_df.iloc[idx]['page_ids'] if p != 0]
+    if len(raw_pids) > len(set(raw_pids)):
+        repeat_count += 1
+        if len(examples) < 3:
+            counts = Counter(raw_pids)
+            examples.append({p: c for p, c in counts.items() if c > 1})
+    else:
+        no_repeat_count += 1
+
+total = repeat_count + no_repeat_count
+print(f"Checked {total:,} users:")
+print(f"  WITH repeated pages: {repeat_count:,} ({repeat_count/total*100:.1f}%)")
+print(f"  NO repeats:          {no_repeat_count:,} ({no_repeat_count/total*100:.1f}%)")
+if examples:
+    print(f"\nRepeat examples:")
+    for e in examples:
+        print(f"  {e}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verification: Time unit check
+
+# COMMAND ----------
+
+sample_times = []
+for _, row in full_df.head(500).iterrows():
+    for p, t in zip(row['page_ids'], row['time_deltas']):
+        if p != 0 and float(t or 0) > 0:
+            sample_times.append(float(t))
+
+if sample_times:
+    arr = np.array(sample_times)
+    med = np.median(arr)
+    print(f"Non-zero time_delta (first 500 users, {len(arr):,} entries):")
+    for p in [25, 50, 75, 90]:
+        print(f"  P{p}: {np.percentile(arr, p):.1f}")
+    print(f"\nIf seconds:      P50 = {med:.1f}s = {med/60:.2f} min")
+    print(f"If milliseconds: P50 = {med/1000:.2f}s")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Extract Journeys
+
+# COMMAND ----------
+
+def extract_journey(row, id_to_page):
+    """
+    Collapse page_ids + time_deltas into per-page summary.
+    - Sums time across all visits to the same page
+    - Counts visits per page
+    - Tracks first occurrence position for ordering
+    """
+    page_ids = row['page_ids']
+    time_deltas = row['time_deltas']
+    if page_ids is None or len(page_ids) == 0:
+        return {}, 0
+
+    page_data = {}
+    total_visits = 0
+
+    for i, (pid, td) in enumerate(zip(page_ids, time_deltas)):
+        if pid == 0:
+            continue
+        total_visits += 1
+        page = id_to_page.get(pid, 'UNK')
+        t = float(td or 0)
+        if page in page_data:
+            page_data[page]['cum_time'] += t
+            page_data[page]['visits'] += 1
+        else:
+            page_data[page] = {'cum_time': t, 'visits': 1, 'first_pos': i}
+
+    return page_data, total_visits
+
+
+extracted = full_df.apply(lambda r: extract_journey(r, id_to_page), axis=1)
+full_df['page_data']      = [r[0] for r in extracted]
+full_df['total_visits']   = [r[1] for r in extracted]
+full_df['unique_pages']   = full_df['page_data'].apply(len)
+full_df['cum_time']       = full_df['page_data'].apply(lambda d: sum(v['cum_time'] for v in d.values()))
+full_df['time_per_page']  = np.where(full_df['unique_pages'] > 0, full_df['cum_time'] / full_df['unique_pages'], 0)
+full_df['time_per_visit'] = np.where(full_df['total_visits'] > 0, full_df['cum_time'] / full_df['total_visits'], 0)
+full_df['pages'] = full_df['page_data'].apply(
+    lambda d: [p for p, _ in sorted(d.items(), key=lambda x: x[1]['first_pos'])] if d else []
+)
+
+print(f"Median unique pages:  {full_df['unique_pages'].median():.0f}")
+print(f"Median total visits:  {full_df['total_visits'].median():.0f}")
+print(f"Median cum time:      {full_df['cum_time'].median()/60:.1f} min")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Quality Filter & Split
+
+# COMMAND ----------
+
+MIN_PAGES = 2
+MIN_TIME  = 10
+P90_TIME  = full_df['cum_time'].quantile(0.90)
+
+quality_df = full_df[
+    (full_df['unique_pages'] >= MIN_PAGES) &
+    (full_df['cum_time'] >= MIN_TIME) &
+    (full_df['cum_time'] <= P90_TIME)
+].copy()
+
+pos_df = quality_df[quality_df['label'] == 1].copy()
+neg_df = quality_df[quality_df['label'] == 0].copy()
+
+print(f"Quality: {len(quality_df):,} / {len(full_df):,} ({len(quality_df)/len(full_df)*100:.0f}%)")
+print(f"  >= {MIN_PAGES} pages, >= {MIN_TIME}s, <= P90 ({P90_TIME/60:.1f} min)")
+print(f"  Completers:     {len(pos_df):,}")
+print(f"  Non-completers: {len(neg_df):,}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC # REPORT 1: Top Journeys by Users
+# MAGIC
+# MAGIC Groups users by **page set** (which pages they visited, ignoring order).
+# MAGIC Two separate tables: one for completers, one for non-completers.
+
+# COMMAND ----------
+
+def build_journey_report(df, label_name, min_users=5):
+    """
+    Group users by their page set. For each set, compute:
+    - users, median/P90/min/max cum_time, median visits,
+      median time_per_page, median time_per_visit, cumulative time total
+    """
+    # Group by page set
+    agg = defaultdict(lambda: {
+        'cum_times': [], 'total_visits': [], 'unique_pages': [],
+        'time_per_page': [], 'time_per_visit': [],
+    })
+    for _, row in df.iterrows():
+        key = frozenset(row['pages'])
+        agg[key]['cum_times'].append(row['cum_time'])
+        agg[key]['total_visits'].append(row['total_visits'])
+        agg[key]['unique_pages'].append(row['unique_pages'])
+        agg[key]['time_per_page'].append(row['time_per_page'])
+        agg[key]['time_per_visit'].append(row['time_per_visit'])
+
+    rows = []
+    for page_set, s in agg.items():
+        n = len(s['cum_times'])
+        if n < min_users:
+            continue
+        t = np.array(s['cum_times'])
+        v = np.array(s['total_visits'])
+        tpp = np.array(s['time_per_page'])
+        tpv = np.array(s['time_per_visit'])
+
+        rows.append({
+            'page_set': ' | '.join(sorted(page_set)),
+            'num_pages': len(page_set),
+            'users': n,
+            'median_time_min': round(np.median(t) / 60, 2),
+            'p90_time_min': round(np.percentile(t, 90) / 60, 2),
+            'min_time_min': round(np.min(t) / 60, 2),
+            'max_time_min': round(np.max(t) / 60, 2),
+            'cum_time_total_min': round(np.sum(t) / 60, 1),
+            'median_visits': round(np.median(v), 1),
+            'p90_visits': round(np.percentile(v, 90), 1),
+            'median_time_per_page_min': round(np.median(tpp) / 60, 3),
+            'median_time_per_visit_sec': round(np.median(tpv), 1),
+        })
+
+    result = pd.DataFrame(rows).sort_values('users', ascending=False)
+    return result
+
+
+pos_journeys = build_journey_report(pos_df, 'Completers')
+neg_journeys = build_journey_report(neg_df, 'Non-Completers')
+
+def print_journey_table(df, title, n=25):
+    print(f"\n{'='*80}")
+    print(title)
+    print("="*80)
+    print(f"{'#Pg':>3} | {'Users':>5} | {'MedTime':>7} | {'P90Time':>7} | {'MinTime':>7} | {'MaxTime':>7} | {'CumTime':>7} | {'MedVis':>6} | {'Tm/Pg':>6} | {'Tm/Vis':>6} | Journey")
+    print("-"*120)
+    for _, r in df.head(n).iterrows():
+        print(f"{r['num_pages']:>3} | {r['users']:>5} | {r['median_time_min']:>5.1f}m | {r['p90_time_min']:>5.1f}m | {r['min_time_min']:>5.1f}m | {r['max_time_min']:>5.1f}m | {r['cum_time_total_min']:>5.0f}m | {r['median_visits']:>6.0f} | {r['median_time_per_page_min']:>4.2f}m | {r['median_time_per_visit_sec']:>4.1f}s | {r['page_set'][:35]}")
+
+print_journey_table(pos_journeys, "REPORT 1a: TOP JOURNEYS — COMPLETERS")
+print_journey_table(neg_journeys, "REPORT 1b: TOP JOURNEYS — NON-COMPLETERS")
+
+pos_journeys.to_csv(f'{DATA_DIR}report1a_journeys_completers_{MODEL_NAME}.csv', index=False)
+neg_journeys.to_csv(f'{DATA_DIR}report1b_journeys_noncompleters_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved report1a ({len(pos_journeys)} sets) and report1b ({len(neg_journeys)} sets)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # REPORT 2: Top Converting / Top Dropout Journeys
+# MAGIC
+# MAGIC Uses the **full quality dataset** (both labels) to compute conversion rate per journey set,
+# MAGIC then produces two tables:
+# MAGIC - 2a: Highest conversion rate (successful paths)
+# MAGIC - 2b: Lowest / zero conversion rate (dropout paths)
+
+# COMMAND ----------
+
+def build_conversion_report(quality_df, min_users=5):
+    """
+    Group ALL quality users by page set, compute conversion rate.
+    """
+    agg = defaultdict(lambda: {'total': 0, 'conversions': 0, 'cum_times': [], 'visits': []})
+
+    for _, row in quality_df.iterrows():
+        key = frozenset(row['pages'])
+        agg[key]['total'] += 1
+        agg[key]['conversions'] += row['label']
+        agg[key]['cum_times'].append(row['cum_time'])
+        agg[key]['visits'].append(row['total_visits'])
+
+    rows = []
+    overall_conv = quality_df['label'].mean()
+
+    for page_set, s in agg.items():
+        if s['total'] < min_users:
+            continue
+        t = np.array(s['cum_times'])
+        v = np.array(s['visits'])
+        conv_rate = s['conversions'] / s['total']
+        rows.append({
+            'page_set': ' | '.join(sorted(page_set)),
+            'num_pages': len(page_set),
+            'total_users': s['total'],
+            'conversions': s['conversions'],
+            'conv_rate_pct': round(conv_rate * 100, 1),
+            'lift': round(conv_rate / overall_conv, 2) if overall_conv > 0 else 0,
+            'median_time_min': round(np.median(t) / 60, 2),
+            'median_visits': round(np.median(v), 1),
+        })
+
+    return pd.DataFrame(rows)
+
+
+conv_df = build_conversion_report(quality_df)
+
+top_converting = conv_df[conv_df['conversions'] > 0].sort_values('conv_rate_pct', ascending=False)
+top_dropout = conv_df.sort_values('conv_rate_pct', ascending=True)
+
+def print_conv_table(df, title, n=20):
+    print(f"\n{'='*80}")
+    print(title)
+    print("="*80)
+    print(f"{'#Pg':>3} | {'Total':>5} | {'Conv':>4} | {'Rate':>5} | {'Lift':>5} | {'MedTime':>7} | {'MedVis':>6} | Journey")
+    print("-"*100)
+    for _, r in df.head(n).iterrows():
+        print(f"{r['num_pages']:>3} | {r['total_users']:>5} | {r['conversions']:>4} | {r['conv_rate_pct']:>4.1f}% | {r['lift']:>5.2f} | {r['median_time_min']:>5.1f}m | {r['median_visits']:>6.0f} | {r['page_set'][:40]}")
+
+print_conv_table(top_converting, "REPORT 2a: HIGHEST CONVERSION JOURNEYS")
+print_conv_table(top_dropout, "REPORT 2b: HIGHEST DROPOUT JOURNEYS (lowest conversion)")
+
+conv_df.to_csv(f'{DATA_DIR}report2_conversion_rates_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved report2 ({len(conv_df)} sets)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # REPORT 3: Last Page Before Exit
+# MAGIC
+# MAGIC Two separate tables:
+# MAGIC - 3a: Where completers were last (page before conversion)
+# MAGIC - 3b: Where non-completers were last (where they dropped off)
+
+# COMMAND ----------
+
+def build_last_page_report(df, min_users=3):
+    """
+    For each user, get their last page. Aggregate stats per last page.
+    """
+    records = []
+    for _, row in df.iterrows():
+        if len(row['pages']) == 0:
+            continue
+        last = row['pages'][-1]
+        lpd = row['page_data'].get(last, {'cum_time': 0, 'visits': 1})
+        records.append({
+            'last_page': last,
+            'cum_time_last': lpd['cum_time'],
+            'visits_last': lpd['visits'],
+            'cum_time_journey': row['cum_time'],
+            'total_visits_journey': row['total_visits'],
+            'unique_pages': row['unique_pages'],
+        })
+
+    lp_df = pd.DataFrame(records)
+    if lp_df.empty:
+        return pd.DataFrame()
+
+    total_users = len(lp_df)
+
+    summary = lp_df.groupby('last_page').agg(
+        users=('last_page', 'count'),
+        median_time_last_min=('cum_time_last', lambda x: round(np.median(x) / 60, 2)),
+        p90_time_last_min=('cum_time_last', lambda x: round(np.percentile(x, 90) / 60, 2)),
+        median_visits_last=('visits_last', 'median'),
+        median_journey_time_min=('cum_time_journey', lambda x: round(np.median(x) / 60, 2)),
+        cum_journey_time_min=('cum_time_journey', lambda x: round(np.sum(x) / 60, 1)),
+        median_journey_visits=('total_visits_journey', 'median'),
+        median_pages=('unique_pages', 'median'),
+    ).reset_index()
+
+    summary['pct'] = round(summary['users'] / total_users * 100, 1)
+    return summary.sort_values('users', ascending=False)
+
+
+pos_last = build_last_page_report(pos_df)
+neg_last = build_last_page_report(neg_df)
+
+def print_last_page_table(df, title, n=20):
+    print(f"\n{'='*80}")
+    print(title)
+    print("="*80)
+    print(f"{'Last Page':<25} | {'Users':>5} | {'%':>5} | {'MedTmLast':>9} | {'P90TmLast':>9} | {'MedVisLast':>10} | {'MedJrnTm':>8} | {'CumJrnTm':>8} | {'MedJrnVis':>9} | {'MedPgs':>6}")
+    print("-"*130)
+    for _, r in df.head(n).iterrows():
+        print(f"{r['last_page'][:25]:<25} | {r['users']:>5} | {r['pct']:>4.1f}% | {r['median_time_last_min']:>7.2f}m | {r['p90_time_last_min']:>7.2f}m | {r['median_visits_last']:>10.0f} | {r['median_journey_time_min']:>6.2f}m | {r['cum_journey_time_min']:>6.1f}m | {r['median_journey_visits']:>9.0f} | {r['median_pages']:>6.0f}")
+
+print_last_page_table(pos_last, "REPORT 3a: LAST PAGE — COMPLETERS (page before conversion)")
+print_last_page_table(neg_last, "REPORT 3b: LAST PAGE — NON-COMPLETERS (where they dropped off)")
+
+pos_last.to_csv(f'{DATA_DIR}report3a_lastpage_completers_{MODEL_NAME}.csv', index=False)
+neg_last.to_csv(f'{DATA_DIR}report3b_lastpage_noncompleters_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved report3a and report3b")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # REPORT 4: Journey Summary Stats
+# MAGIC
+# MAGIC Two tables showing median, mean, min, max, P90 for all metrics.
+
+# COMMAND ----------
+
+def build_summary(df, name):
+    """Full summary for one group."""
+    metrics = {}
+    for label, series in [
+        ('Unique Pages',            df['unique_pages']),
+        ('Total Visits',            df['total_visits']),
+        ('Cum Time (min)',          df['cum_time'] / 60),
+        ('Time per Page (min)',     df['time_per_page'] / 60),
+        ('Time per Visit (sec)',    df['time_per_visit']),
+    ]:
+        metrics[f'{label} — Median'] = round(series.median(), 2)
+        metrics[f'{label} — Mean']   = round(series.mean(), 2)
+        metrics[f'{label} — Min']    = round(series.min(), 2)
+        metrics[f'{label} — Max']    = round(series.max(), 2)
+        metrics[f'{label} — P90']    = round(series.quantile(0.90), 2)
+
+    metrics['Cum Time Total (hrs)']   = round(df['cum_time'].sum() / 3600, 1)
+    metrics['Total Visits (sum)']     = int(df['total_visits'].sum())
+    metrics['Users']                  = len(df)
+
+    return pd.DataFrame({'Metric': list(metrics.keys()), name: list(metrics.values())})
+
+
+pos_summary = build_summary(pos_df, 'Completers')
+neg_summary = build_summary(neg_df, 'Non-Completers')
+
+print(f"\n{'='*80}")
+print("REPORT 4a: SUMMARY — COMPLETERS")
+print("="*80)
+print(pos_summary.to_string(index=False))
+
+print(f"\n{'='*80}")
+print("REPORT 4b: SUMMARY — NON-COMPLETERS")
+print("="*80)
+print(neg_summary.to_string(index=False))
+
+pos_summary.to_csv(f'{DATA_DIR}report4a_summary_completers_{MODEL_NAME}.csv', index=False)
+neg_summary.to_csv(f'{DATA_DIR}report4b_summary_noncompleters_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved report4a and report4b")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # REPORT 5: Per-Page Stats
+# MAGIC
+# MAGIC For each page, two separate tables:
+# MAGIC - How completers interact with this page
+# MAGIC - How non-completers interact with this page
+
+# COMMAND ----------
+
+def build_page_stats(df, label_name, min_users=10):
+    """
+    Per-page stats for one group:
+    - How many users visited this page
+    - Cumulative time on this page (median, P90, total)
+    - Visits to this page (median, P90)
+    """
+    page_agg = defaultdict(lambda: {'users': 0, 'cum_times': [], 'visits': []})
+
+    for _, row in df.iterrows():
+        for page, data in row['page_data'].items():
+            page_agg[page]['users'] += 1
+            page_agg[page]['cum_times'].append(data['cum_time'])
+            page_agg[page]['visits'].append(data['visits'])
+
+    total_users = len(df)
+    rows = []
+
+    for page, s in page_agg.items():
+        if s['users'] < min_users:
+            continue
+        t = np.array(s['cum_times'])
+        v = np.array(s['visits'])
+        rows.append({
+            'page': page,
+            'users': s['users'],
+            'presence_pct': round(s['users'] / total_users * 100, 1),
+            'median_cum_time_min': round(np.median(t) / 60, 2),
+            'p90_cum_time_min': round(np.percentile(t, 90) / 60, 2),
+            'total_cum_time_min': round(np.sum(t) / 60, 1),
+            'median_visits': round(np.median(v), 1),
+            'p90_visits': round(np.percentile(v, 90), 1),
+            'median_time_per_visit_sec': round(np.median(t / v), 1),
+        })
+
+    return pd.DataFrame(rows).sort_values('users', ascending=False)
+
+
+pos_pages = build_page_stats(pos_df, 'Completers')
+neg_pages = build_page_stats(neg_df, 'Non-Completers')
+
+def print_page_table(df, title, n=20):
+    print(f"\n{'='*80}")
+    print(title)
+    print("="*80)
+    print(f"{'Page':<25} | {'Users':>5} | {'Pres%':>5} | {'MedTime':>7} | {'P90Time':>7} | {'TotalTime':>9} | {'MedVis':>6} | {'P90Vis':>6} | {'Tm/Vis':>6}")
+    print("-"*105)
+    for _, r in df.head(n).iterrows():
+        print(f"{r['page'][:25]:<25} | {r['users']:>5} | {r['presence_pct']:>4.1f}% | {r['median_cum_time_min']:>5.2f}m | {r['p90_cum_time_min']:>5.2f}m | {r['total_cum_time_min']:>7.1f}m | {r['median_visits']:>6.1f} | {r['p90_visits']:>6.1f} | {r['median_time_per_visit_sec']:>4.1f}s")
+
+print_page_table(pos_pages, "REPORT 5a: PAGE STATS — COMPLETERS")
+print_page_table(neg_pages, "REPORT 5b: PAGE STATS — NON-COMPLETERS")
+
+pos_pages.to_csv(f'{DATA_DIR}report5a_pages_completers_{MODEL_NAME}.csv', index=False)
+neg_pages.to_csv(f'{DATA_DIR}report5b_pages_noncompleters_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved report5a ({len(pos_pages)} pages) and report5b ({len(neg_pages)} pages)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC # All Outputs
+
+# COMMAND ----------
+
+print("="*60)
+print("ALL FILES")
+print("="*60)
+print(f"""
+Report 1: Top journeys by user count
+  report1a_journeys_completers_{MODEL_NAME}.csv
+  report1b_journeys_noncompleters_{MODEL_NAME}.csv
+
+Report 2: Conversion / dropout rates per journey set
+  report2_conversion_rates_{MODEL_NAME}.csv
+
+Report 3: Last page before exit
+  report3a_lastpage_completers_{MODEL_NAME}.csv
+  report3b_lastpage_noncompleters_{MODEL_NAME}.csv
+
+Report 4: Journey summary stats
+  report4a_summary_completers_{MODEL_NAME}.csv
+  report4b_summary_noncompleters_{MODEL_NAME}.csv
+
+Report 5: Per-page stats
+  report5a_pages_completers_{MODEL_NAME}.csv
+  report5b_pages_noncompleters_{MODEL_NAME}.csv
+
+Filters: >= {MIN_PAGES} pages, >= {MIN_TIME}s, <= P90 ({P90_TIME/60:.1f}m)
+✓ DONE
+""")
