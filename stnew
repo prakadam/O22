@@ -1,0 +1,375 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Journey Analysis — Report 1: Top Journeys
+# MAGIC
+# MAGIC Source: `page_clickstream_data`
+# MAGIC Conversion: `ole_started` (1 = converted, 0 = not)
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 0: INSPECT COLUMNS
+# ============================================================================
+
+print(f"Shape: {page_clickstream_data.shape}\n")
+for col in sorted(page_clickstream_data.columns):
+    dtype = page_clickstream_data[col].dtype
+    try:
+        sample = str(page_clickstream_data[col].iloc[0])[:80]
+    except:
+        sample = "N/A"
+    print(f"  {col:<35} {str(dtype):<15} {sample}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 1: COLUMN MAPPING — edit if names differ
+# ============================================================================
+
+COL_MCID         = 'mcid'
+COL_CONVERTED    = 'ole_started'               # 1=converted, 0=not
+COL_SEQ_RAW      = 'page_sequence_raw'         # list of structs
+
+# Struct fields inside page_sequence_raw
+STRUCT_POSITION  = 'seq_position'
+STRUCT_PAGE      = 'new_page_name'
+STRUCT_TIME      = 'time_delta_capped'
+
+# Static features
+COL_VISIT_COUNT  = 'visit_count'               # # of visits/sessions
+COL_SEQ_LEN      = 'sequence_length_pre'       # total page hits across all visits
+COL_UNIQUE_PAGES = 'unique_pages_pre'          # distinct pages (set size)
+COL_AVG_DEPTH    = 'avg_visit_depth_pre'
+COL_DCE          = 'dce_used_pre'
+COL_MEMBER       = 'member_flag_pre'
+COL_SHOPPER      = 'shopper_profile_pre'
+COL_INVOCA       = 'Invoca_Calls'
+COL_CHAT_REACT   = 'Chat_Reactive_Clicks'
+COL_CHAT_PROACT  = 'Chat_Proactive_Yes'
+COL_DAYS         = 'days_in_research_phase_pre'
+
+# Verify
+print("Column check:")
+for col in [COL_MCID, COL_CONVERTED, COL_SEQ_RAW, COL_VISIT_COUNT,
+            COL_SEQ_LEN, COL_UNIQUE_PAGES, COL_AVG_DEPTH,
+            COL_DCE, COL_MEMBER, COL_SHOPPER, COL_INVOCA,
+            COL_CHAT_REACT, COL_CHAT_PROACT, COL_DAYS]:
+    print(f"  {'✓' if col in page_clickstream_data.columns else '✗'} {col}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 2: EXTRACT FROM page_sequence_raw
+# ============================================================================
+# Struct: {seq_position, new_page_name, time_delta_capped}
+#
+# Produces per user:
+#   page_data:     {page: {cum_time, visits}} — time summed, visits counted
+#   page_set:      frozenset — for grouping journeys
+#   pages_ordered: list — for last-page analysis later
+#   total_time:    sum of all time_delta_capped
+# ============================================================================
+
+def extract_from_raw_sequence(seq_raw):
+    if not seq_raw:
+        return {}, [], frozenset(), 0.0
+
+    try:
+        sorted_seq = sorted(seq_raw,
+            key=lambda x: x[STRUCT_POSITION] if isinstance(x, dict) else getattr(x, STRUCT_POSITION))
+    except:
+        sorted_seq = seq_raw
+
+    page_data = {}
+    total_time = 0.0
+
+    for item in sorted_seq:
+        if isinstance(item, dict):
+            page = item.get(STRUCT_PAGE, 'UNK')
+            t = float(item.get(STRUCT_TIME, 0) or 0)
+        else:
+            page = getattr(item, STRUCT_PAGE, 'UNK')
+            t = float(getattr(item, STRUCT_TIME, 0) or 0)
+
+        total_time += t
+        if page in page_data:
+            page_data[page]['cum_time'] += t
+            page_data[page]['visits'] += 1
+        else:
+            page_data[page] = {'cum_time': t, 'visits': 1}
+
+    return page_data, list(page_data.keys()), frozenset(page_data.keys()), total_time
+
+result = page_clickstream_data[COL_SEQ_RAW].apply(extract_from_raw_sequence)
+page_clickstream_data['page_data']     = [r[0] for r in result]
+page_clickstream_data['pages_ordered'] = [r[1] for r in result]
+page_clickstream_data['page_set']      = [r[2] for r in result]
+page_clickstream_data['total_time']    = [r[3] for r in result]
+
+# Derived
+page_clickstream_data['time_per_page'] = np.where(
+    page_clickstream_data[COL_UNIQUE_PAGES] > 0,
+    page_clickstream_data['total_time'] / page_clickstream_data[COL_UNIQUE_PAGES], 0)
+
+page_clickstream_data['time_per_visit'] = np.where(
+    page_clickstream_data[COL_VISIT_COUNT] > 0,
+    page_clickstream_data['total_time'] / page_clickstream_data[COL_VISIT_COUNT], 0)
+
+page_clickstream_data['pages_per_visit'] = np.where(
+    page_clickstream_data[COL_VISIT_COUNT] > 0,
+    page_clickstream_data[COL_SEQ_LEN] / page_clickstream_data[COL_VISIT_COUNT], 0)
+
+print("✓ Extraction complete")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 3: OVERVIEW
+# ============================================================================
+
+df = page_clickstream_data  # shorthand for printing
+
+print("="*60)
+print("DATASET OVERVIEW")
+print("="*60)
+print(f"Total users:     {len(df):,}")
+print(f"  Converted:     {(df[COL_CONVERTED] == 1).sum():,}")
+print(f"  Not converted: {(df[COL_CONVERTED] == 0).sum():,}")
+print()
+
+print("--- VISITS & PAGES ---")
+print(f"{'Metric':<30} | {'P25':>8} | {'P50':>8} | {'P75':>8} | {'P90':>8}")
+print("-"*75)
+for col, label in [
+    (COL_VISIT_COUNT,   '# Visits (sessions)'),
+    (COL_SEQ_LEN,       'Total Page Hits (seq len)'),
+    (COL_UNIQUE_PAGES,  'Unique Pages (set size)'),
+    ('pages_per_visit', 'Pages per Visit'),
+]:
+    if col in df.columns:
+        print(f"{label:<30} | {df[col].quantile(0.25):>8.1f} | {df[col].quantile(0.50):>8.1f} | {df[col].quantile(0.75):>8.1f} | {df[col].quantile(0.90):>8.1f}")
+
+print()
+print("--- TIME ---")
+print(f"{'Metric':<30} | {'P25':>8} | {'P50':>8} | {'P75':>8} | {'P90':>8}")
+print("-"*75)
+for col, label in [
+    ('total_time',     'Cumulative Time (sec)'),
+    ('time_per_page',  'Time per Unique Page (sec)'),
+    ('time_per_visit', 'Time per Visit (sec)'),
+]:
+    if col in df.columns:
+        print(f"{label:<30} | {df[col].quantile(0.25):>8.1f} | {df[col].quantile(0.50):>8.1f} | {df[col].quantile(0.75):>8.1f} | {df[col].quantile(0.90):>8.1f}")
+
+print()
+print("--- ENGAGEMENT ---")
+print(f"{'Feature':<30} | {'Zero%':>6} | {'Mean':>8} | {'P50':>8} | {'P90':>8}")
+print("-"*75)
+for col, label in [
+    (COL_AVG_DEPTH,  'Avg Visit Depth'),
+    (COL_DCE,        'DCE Used'),
+    (COL_INVOCA,     'Invoca Calls'),
+    (COL_CHAT_REACT, 'Chat Reactive'),
+    (COL_CHAT_PROACT,'Chat Proactive'),
+    (COL_SHOPPER,    'Shopper Profile Visits'),
+    (COL_MEMBER,     'Member Flag'),
+]:
+    if col in df.columns:
+        zero_pct = (df[col] == 0).mean() * 100
+        print(f"{label:<30} | {zero_pct:>5.1f}% | {df[col].mean():>8.2f} | {df[col].quantile(0.50):>8.1f} | {df[col].quantile(0.90):>8.1f}")
+
+print()
+print("--- DATA QUALITY ---")
+print(f"Zero-time users:    {(df['total_time'] == 0).sum():,}")
+print(f"Single-page users:  {(df[COL_UNIQUE_PAGES] <= 1).sum():,}")
+print(f"Single-visit users: {(df[COL_VISIT_COUNT] <= 1).sum():,}")
+print(f"Unique journey sets:{df['page_set'].nunique():,}")
+
+del df  # remove shorthand
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 4: QUALITY FILTERS
+# ============================================================================
+
+MIN_PAGES = 2
+MIN_TIME  = 10
+P90_TIME  = page_clickstream_data['total_time'].quantile(0.90)
+
+mask = (
+    (page_clickstream_data[COL_UNIQUE_PAGES] >= MIN_PAGES) &
+    (page_clickstream_data['total_time'] >= MIN_TIME) &
+    (page_clickstream_data['total_time'] <= P90_TIME)
+)
+page_clickstream_data['quality'] = mask
+
+print("="*60)
+print("QUALITY FILTER")
+print("="*60)
+print(f"Filters:")
+print(f"  {COL_UNIQUE_PAGES} >= {MIN_PAGES}")
+print(f"  total_time >= {MIN_TIME} sec")
+print(f"  total_time <= P90 = {P90_TIME:.0f} sec ({P90_TIME/60:.1f} min)")
+print()
+kept = mask.sum()
+print(f"Kept: {kept:,} / {len(page_clickstream_data):,} ({kept/len(page_clickstream_data)*100:.0f}%)")
+
+q = page_clickstream_data[mask]
+print(f"  Converted:      {(q[COL_CONVERTED] == 1).sum():,}")
+print(f"  Not converted:  {(q[COL_CONVERTED] == 0).sum():,}")
+print(f"  Unique sets:    {q['page_set'].nunique():,}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 5: REPORT 1 — TOP JOURNEYS
+# ============================================================================
+# Pass converted or non-converted subset to get separate reports.
+# Does NOT modify page_clickstream_data — just filters and aggregates.
+# ============================================================================
+
+def build_journey_report(data, min_users=5):
+    """
+    Group by page_set, aggregate static + derived features.
+    data: filtered subset of page_clickstream_data
+    """
+    groups = defaultdict(lambda: {
+        'total_times': [], 'visit_counts': [], 'seq_lens': [],
+        'time_per_page': [], 'time_per_visit': [], 'pages_per_visit': [],
+        'avg_depths': [], 'dce': [], 'invoca': [],
+        'chat_react': [], 'chat_proact': [],
+    })
+
+    for _, row in data.iterrows():
+        g = groups[row['page_set']]
+        g['total_times'].append(row['total_time'])
+        g['visit_counts'].append(row[COL_VISIT_COUNT])
+        g['seq_lens'].append(row[COL_SEQ_LEN])
+        g['time_per_page'].append(row['time_per_page'])
+        g['time_per_visit'].append(row['time_per_visit'])
+        g['pages_per_visit'].append(row['pages_per_visit'])
+        for feat, col in [('avg_depths', COL_AVG_DEPTH), ('dce', COL_DCE),
+                          ('invoca', COL_INVOCA), ('chat_react', COL_CHAT_REACT),
+                          ('chat_proact', COL_CHAT_PROACT)]:
+            if col in data.columns:
+                g[feat].append(row[col])
+
+    rows = []
+    for page_set, g in groups.items():
+        n = len(g['total_times'])
+        if n < min_users:
+            continue
+
+        t   = np.array(g['total_times'])
+        vc  = np.array(g['visit_counts'])
+        seq = np.array(g['seq_lens'])
+        tpp = np.array(g['time_per_page'])
+        tpv = np.array(g['time_per_visit'])
+        ppv = np.array(g['pages_per_visit'])
+
+        r = {
+            'page_set':               ' | '.join(sorted(page_set)),
+            'num_pages':              len(page_set),
+            'users':                  n,
+            # Visits (sessions)
+            'median_visits':          round(float(np.median(vc)), 1),
+            'p90_visits':             round(float(np.percentile(vc, 90)), 1),
+            'min_visits':             int(np.min(vc)),
+            'max_visits':             int(np.max(vc)),
+            # Page hits (sequence length)
+            'median_page_hits':       round(float(np.median(seq)), 1),
+            'p90_page_hits':          round(float(np.percentile(seq, 90)), 1),
+            # Pages per visit
+            'median_pages_per_visit': round(float(np.median(ppv)), 1),
+            # Cumulative time (minutes)
+            'median_time_min':        round(float(np.median(t)) / 60, 2),
+            'p90_time_min':           round(float(np.percentile(t, 90)) / 60, 2),
+            'min_time_min':           round(float(np.min(t)) / 60, 2),
+            'max_time_min':           round(float(np.max(t)) / 60, 2),
+            'cum_time_total_min':     round(float(np.sum(t)) / 60, 1),
+            # Time per page (minutes)
+            'median_time_per_page_min': round(float(np.median(tpp)) / 60, 3),
+            # Time per visit (minutes)
+            'median_time_per_visit_min': round(float(np.median(tpv)) / 60, 2),
+        }
+        # Engagement
+        for feat, name in [('avg_depths', 'median_avg_depth'),
+                            ('dce', 'median_dce'),
+                            ('invoca', 'median_invoca'),
+                            ('chat_react', 'median_chat_reactive'),
+                            ('chat_proact', 'median_chat_proactive')]:
+            if g[feat]:
+                r[name] = round(float(np.median(g[feat])), 1)
+        rows.append(r)
+
+    return pd.DataFrame(rows).sort_values('users', ascending=False)
+
+
+# --- Converted users, quality filtered ---
+converted = page_clickstream_data[
+    (page_clickstream_data['quality']) &
+    (page_clickstream_data[COL_CONVERTED] == 1)
+]
+
+pos_journeys = build_journey_report(converted, min_users=5)
+
+# --- Print ---
+print("="*120)
+print(f"REPORT 1: TOP JOURNEYS — CONVERTED ({len(converted):,} users)")
+print("="*120)
+print(f"Unique sets: {len(pos_journeys):,} (>= 5 users)\n")
+
+header = (
+    f"{'#Pg':>3} | {'Users':>5} | "
+    f"{'MedVis':>6} | {'P90Vis':>6} | "
+    f"{'MedHits':>7} | {'Pg/Vis':>6} | "
+    f"{'MedTime':>7} | {'P90Time':>7} | {'CumTime':>7} | "
+    f"{'Tm/Pg':>6} | {'Tm/Vis':>6} | "
+    f"{'DCE':>4} | {'Inv':>4} | {'Chat':>4} | "
+    f"Journey"
+)
+print(header)
+print("-"*len(header))
+for _, r in pos_journeys.head(25).iterrows():
+    dce  = r.get('median_dce', 0)
+    inv  = r.get('median_invoca', 0)
+    chat = r.get('median_chat_reactive', 0) + r.get('median_chat_proactive', 0)
+    print(
+        f"{r['num_pages']:>3} | {r['users']:>5} | "
+        f"{r['median_visits']:>6.0f} | {r['p90_visits']:>6.0f} | "
+        f"{r['median_page_hits']:>7.0f} | {r['median_pages_per_visit']:>6.1f} | "
+        f"{r['median_time_min']:>5.1f}m | {r['p90_time_min']:>5.1f}m | {r['cum_time_total_min']:>5.0f}m | "
+        f"{r['median_time_per_page_min']:>4.2f}m | {r['median_time_per_visit_min']:>4.2f}m | "
+        f"{dce:>4.0f} | {inv:>4.0f} | {chat:>4.0f} | "
+        f"{r['page_set'][:30]}"
+    )
+
+pos_journeys.to_csv(f'{DATA_DIR}report1_journeys_converted_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved ({len(pos_journeys)} rows)")
+print(f"  Top 25 cover {pos_journeys.head(25)['users'].sum():,} / {len(converted):,} "
+      f"({pos_journeys.head(25)['users'].sum()/len(converted)*100:.0f}%)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## For non-converted: same function, different filter
+# MAGIC ```python
+# MAGIC not_converted = page_clickstream_data[
+# MAGIC     (page_clickstream_data['quality']) &
+# MAGIC     (page_clickstream_data[COL_CONVERTED] == 0)
+# MAGIC ]
+# MAGIC neg_journeys = build_journey_report(not_converted, min_users=5)
+# MAGIC ```
