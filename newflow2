@@ -1,0 +1,419 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Journey Analysis — Step by Step
+# MAGIC Setup + Report 1 (Top Journeys — Completers)
+# MAGIC
+# MAGIC ### Your Data Pipeline Creates:
+# MAGIC | Static Feature | Source | What It Is |
+# MAGIC |---|---|---|
+# MAGIC | `sequence_length_pre` | `F.count("*")` | **Journey depth** — total raw hits (before dedup) |
+# MAGIC | `unique_pages_pre` | `F.countDistinct("final_pages")` | **Set size** — distinct pages |
+# MAGIC | `avg_visit_depth_pre` | `F.avg("visit_depth")` | Avg visit depth per page |
+# MAGIC | `dce_used_pre` | `F.sum("DCE_Visits")` | DCE usage count |
+# MAGIC | `member_flag_pre` | `F.max("member_flag")` | Member flag |
+# MAGIC | `shopper_profile_pre` | `F.sum("shopper_profile_visits")` | Shopper profile visits |
+# MAGIC | `days_in_research_phase_pre` | `datediff(max, min)` | Days from first to last visit |
+# MAGIC | `Invoca_Calls` | `F.max("Invoca_Calls")` | Phone calls |
+# MAGIC | `Chat_Reactive_Clicks` | `F.max("Chat_Reactive_Clicks")` | Reactive chat |
+# MAGIC | `Chat_Proactive_Yes` | `F.max("Chat_Proactive_Yes")` | Proactive chat |
+# MAGIC | `page_sequence_raw` | collect_list of structs | Raw sequence with position, page, time |
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Assumes full_df and id_to_page are ready
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 0: CHECK ACTUAL COLUMNS IN YOUR PARQUET
+# ============================================================================
+
+print("="*60)
+print("COLUMNS IN full_df")
+print("="*60)
+print(f"Shape: {full_df.shape}")
+print()
+for col in sorted(full_df.columns):
+    dtype = full_df[col].dtype
+    try:
+        sample = str(full_df[col].iloc[0])[:80]
+    except:
+        sample = "N/A"
+    print(f"  {col:<35} {str(dtype):<15} {sample}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 1: MAP COLUMN NAMES
+# ============================================================================
+# Your parquet column names may differ slightly from the Spark aggregation.
+# This cell maps them so the rest of the notebook works regardless.
+#
+# EDIT THESE if your column names are different:
+# ============================================================================
+
+# --- Core columns (EDIT if needed) ---
+COL_LABEL        = 'label'
+COL_MCID         = 'mcid'
+COL_PAGE_IDS     = 'page_ids'
+COL_TIME_DELTAS  = 'time_deltas'
+
+# --- Static features from your pipeline ---
+# Journey depth: total raw hits before dedup (F.count("*"))
+COL_SEQ_LEN      = 'sequence_length_pre'   # EDIT if different
+
+# Set size: count of distinct pages (F.countDistinct("final_pages"))
+COL_UNIQUE_PAGES = 'unique_pages_pre'      # EDIT if different
+
+# Other static features
+COL_AVG_DEPTH    = 'avg_visit_depth_pre'
+COL_DCE          = 'dce_used_pre'
+COL_MEMBER       = 'member_flag_pre'
+COL_SHOPPER      = 'shopper_profile_pre'
+COL_INVOCA       = 'Invoca_Calls'
+COL_CHAT_REACT   = 'Chat_Reactive_Clicks'
+COL_CHAT_PROACT  = 'Chat_Proactive_Yes'
+COL_DAYS         = 'days_in_research_phase_pre'
+
+# --- Check which exist ---
+all_expected = [COL_LABEL, COL_MCID, COL_PAGE_IDS, COL_TIME_DELTAS,
+                COL_SEQ_LEN, COL_UNIQUE_PAGES, COL_AVG_DEPTH,
+                COL_DCE, COL_MEMBER, COL_SHOPPER, COL_INVOCA,
+                COL_CHAT_REACT, COL_CHAT_PROACT, COL_DAYS]
+
+print("Column check:")
+for col in all_expected:
+    exists = col in full_df.columns
+    print(f"  {'✓' if exists else '✗'} {col}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 2: COMPUTE CUMULATIVE TIME + DERIVED METRICS
+# ============================================================================
+#
+# total_time: sum of ALL time_deltas (before dedup)
+#   HOME(5s) → PLAN(10s) → HOME(3s) → total_time = 18s
+#
+# time_per_page: total_time / unique_pages_pre (set size)
+#   18s / 2 pages = 9s per unique page
+#
+# time_per_visit: total_time / sequence_length_pre (journey depth)
+#   18s / 3 hits = 6s per raw visit
+#
+# depth_ratio: sequence_length_pre / unique_pages_pre
+#   3 hits / 2 pages = 1.5 (each page visited 1.5x on avg)
+# ============================================================================
+
+full_df['total_time'] = full_df[COL_TIME_DELTAS].apply(
+    lambda tds: sum(float(t or 0) for t in tds) if tds is not None else 0
+)
+
+full_df['time_per_page'] = np.where(
+    full_df[COL_UNIQUE_PAGES] > 0,
+    full_df['total_time'] / full_df[COL_UNIQUE_PAGES],
+    0
+)
+
+full_df['time_per_visit'] = np.where(
+    full_df[COL_SEQ_LEN] > 0,
+    full_df['total_time'] / full_df[COL_SEQ_LEN],
+    0
+)
+
+full_df['depth_ratio'] = np.where(
+    full_df[COL_UNIQUE_PAGES] > 0,
+    full_df[COL_SEQ_LEN] / full_df[COL_UNIQUE_PAGES],
+    0
+)
+
+print("✓ Computed: total_time, time_per_page, time_per_visit, depth_ratio")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 2b: BUILD page_set AND page_data FROM RAW SEQUENCE
+# ============================================================================
+#
+# page_set: frozenset of unique page names → used to GROUP journeys
+#
+# page_data: {page_name: {cum_time: float, visits: int}}
+#   Per-page breakdown. When a page appears multiple times:
+#   - cum_time: SUMS time across all visits to that page
+#   - visits:   COUNTS how many times that page appeared
+#
+#   Example: HOME(5s) → PLAN(10s) → HOME(3s)
+#   page_data = {'HOME': {cum_time: 8, visits: 2},
+#                'PLAN': {cum_time: 10, visits: 1}}
+#
+# pages_ordered: page names in order of first occurrence
+#   → needed for "last page before exit" later
+# ============================================================================
+
+def build_page_data(row, id_to_page):
+    page_ids = row[COL_PAGE_IDS]
+    time_deltas = row[COL_TIME_DELTAS]
+    if page_ids is None or len(page_ids) == 0:
+        return {}, [], frozenset()
+
+    page_data = {}
+    for pid, td in zip(page_ids, time_deltas):
+        if pid == 0:
+            continue
+        page = id_to_page.get(pid, 'UNK')
+        t = float(td or 0)
+        if page in page_data:
+            page_data[page]['cum_time'] += t
+            page_data[page]['visits'] += 1
+        else:
+            page_data[page] = {'cum_time': t, 'visits': 1}
+
+    pages_ordered = list(page_data.keys())
+    page_set = frozenset(pages_ordered)
+    return page_data, pages_ordered, page_set
+
+result = full_df.apply(lambda r: build_page_data(r, id_to_page), axis=1)
+full_df['page_data']     = [r[0] for r in result]
+full_df['pages_ordered'] = [r[1] for r in result]
+full_df['page_set']      = [r[2] for r in result]
+
+print("✓ Built: page_data, pages_ordered, page_set")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 3: OVERVIEW — BEFORE FILTERS
+# ============================================================================
+
+print("="*60)
+print("FULL DATASET — BEFORE FILTERS")
+print("="*60)
+print(f"Total users:        {len(full_df):,}")
+print(f"  Completers (1):   {(full_df[COL_LABEL] == 1).sum():,}")
+print(f"  Non-completers:   {(full_df[COL_LABEL] == 0).sum():,}")
+print()
+
+print(f"--- JOURNEY STRUCTURE ---")
+print(f"{'Metric':<30} | {'P25':>8} | {'P50':>8} | {'P75':>8} | {'P90':>8}")
+print("-"*75)
+for col, label in [
+    (COL_UNIQUE_PAGES, 'Unique Pages (set size)'),
+    (COL_SEQ_LEN,      'Sequence Length (depth)'),
+    ('depth_ratio',    'Depth Ratio (depth/pages)'),
+    ('total_time',     'Cumulative Time (sec)'),
+    ('time_per_page',  'Time per Page (sec)'),
+    ('time_per_visit', 'Time per Visit (sec)'),
+]:
+    if col in full_df.columns:
+        print(f"{label:<30} | {full_df[col].quantile(0.25):>8.1f} | {full_df[col].quantile(0.50):>8.1f} | {full_df[col].quantile(0.75):>8.1f} | {full_df[col].quantile(0.90):>8.1f}")
+
+print()
+print(f"--- ENGAGEMENT FEATURES ---")
+print(f"{'Feature':<30} | {'Zero%':>6} | {'Mean':>8} | {'P50':>8} | {'P90':>8}")
+print("-"*75)
+for col, label in [
+    (COL_AVG_DEPTH,  'Avg Visit Depth'),
+    (COL_DCE,        'DCE Used'),
+    (COL_INVOCA,     'Invoca Calls'),
+    (COL_CHAT_REACT, 'Chat Reactive'),
+    (COL_CHAT_PROACT,'Chat Proactive'),
+    (COL_SHOPPER,    'Shopper Profile Visits'),
+    (COL_MEMBER,     'Member Flag'),
+]:
+    if col in full_df.columns:
+        zero_pct = (full_df[col] == 0).mean() * 100
+        print(f"{label:<30} | {zero_pct:>5.1f}% | {full_df[col].mean():>8.2f} | {full_df[col].quantile(0.50):>8.1f} | {full_df[col].quantile(0.90):>8.1f}")
+
+if COL_DAYS in full_df.columns:
+    print(f"\nDays in Research Phase:")
+    for p in [25, 50, 75, 90]:
+        print(f"  P{p}: {full_df[COL_DAYS].quantile(p/100):.0f} days")
+
+print()
+print(f"--- DATA QUALITY ---")
+print(f"Zero-time users:             {(full_df['total_time'] == 0).sum():,}")
+print(f"Single-page users:           {(full_df[COL_UNIQUE_PAGES] <= 1).sum():,}")
+same = (full_df[COL_SEQ_LEN] == full_df[COL_UNIQUE_PAGES]).sum()
+diff = (full_df[COL_SEQ_LEN] != full_df[COL_UNIQUE_PAGES]).sum()
+print(f"Depth == Pages (no revisit): {same:,} ({same/len(full_df)*100:.1f}%)")
+print(f"Depth > Pages (revisits):    {diff:,} ({diff/len(full_df)*100:.1f}%)")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 4: QUALITY FILTERS
+# ============================================================================
+
+MIN_PAGES = 2
+MIN_TIME  = 10
+P90_TIME  = full_df['total_time'].quantile(0.90)
+
+quality_df = full_df[
+    (full_df[COL_UNIQUE_PAGES] >= MIN_PAGES) &
+    (full_df['total_time'] >= MIN_TIME) &
+    (full_df['total_time'] <= P90_TIME)
+].copy()
+
+pos_df = quality_df[quality_df[COL_LABEL] == 1].copy()
+neg_df = quality_df[quality_df[COL_LABEL] == 0].copy()
+
+print("="*60)
+print("AFTER QUALITY FILTERS")
+print("="*60)
+print(f"Filters:")
+print(f"  {COL_UNIQUE_PAGES} >= {MIN_PAGES}")
+print(f"  total_time >= {MIN_TIME} sec")
+print(f"  total_time <= P90 = {P90_TIME:.0f} sec ({P90_TIME/60:.1f} min)")
+print()
+print(f"Kept: {len(quality_df):,} / {len(full_df):,} ({len(quality_df)/len(full_df)*100:.0f}%)")
+print(f"  Completers:     {len(pos_df):,}")
+print(f"  Non-completers: {len(neg_df):,}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 5: REPORT 1 — TOP JOURNEYS (COMPLETERS)
+# ============================================================================
+#
+# Groups completers by page_set.
+# Aggregates using STATIC FEATURES:
+#   - total_time        → cumulative (already summed incl revisits)
+#   - COL_SEQ_LEN       → journey depth from pipeline (NOT recomputed)
+#   - COL_UNIQUE_PAGES  → set size from pipeline (NOT recomputed)
+#   - depth_ratio       → seq_len / unique_pages
+#   - time_per_page     → total_time / unique_pages
+#   - time_per_visit    → total_time / seq_len
+#   - Engagement:  DCE, Invoca, Chat, Avg Visit Depth
+#
+# KEY DIFFERENCE from before:
+#   median_depth comes from sequence_length_pre (pipeline)
+#   NOT from counting unique pages in page_data
+#   So depth ≠ pages when users revisit pages
+# ============================================================================
+
+def build_journey_report(df, min_users=5):
+    groups = defaultdict(lambda: {
+        'total_times': [], 'seq_lens': [], 'set_sizes': [],
+        'depth_ratios': [], 'time_per_page': [], 'time_per_visit': [],
+        'avg_depths': [], 'dce': [], 'invoca': [],
+        'chat_react': [], 'chat_proact': [],
+    })
+
+    for _, row in df.iterrows():
+        key = row['page_set']
+        g = groups[key]
+        g['total_times'].append(row['total_time'])
+        g['seq_lens'].append(row[COL_SEQ_LEN])
+        g['set_sizes'].append(row[COL_UNIQUE_PAGES])
+        g['depth_ratios'].append(row['depth_ratio'])
+        g['time_per_page'].append(row['time_per_page'])
+        g['time_per_visit'].append(row['time_per_visit'])
+        for feat, col in [('avg_depths', COL_AVG_DEPTH), ('dce', COL_DCE),
+                          ('invoca', COL_INVOCA), ('chat_react', COL_CHAT_REACT),
+                          ('chat_proact', COL_CHAT_PROACT)]:
+            if col in df.columns:
+                g[feat].append(row[col])
+
+    rows = []
+    for page_set, g in groups.items():
+        n = len(g['total_times'])
+        if n < min_users:
+            continue
+
+        t   = np.array(g['total_times'])
+        seq = np.array(g['seq_lens'])
+        dr  = np.array(g['depth_ratios'])
+        tpp = np.array(g['time_per_page'])
+        tpv = np.array(g['time_per_visit'])
+
+        row_data = {
+            'page_set':      ' | '.join(sorted(page_set)),
+            'num_pages':     len(page_set),
+            'users':         n,
+            # Cumulative time (minutes)
+            'median_time_min':    round(float(np.median(t)) / 60, 2),
+            'p90_time_min':       round(float(np.percentile(t, 90)) / 60, 2),
+            'min_time_min':       round(float(np.min(t)) / 60, 2),
+            'max_time_min':       round(float(np.max(t)) / 60, 2),
+            'cum_time_total_min': round(float(np.sum(t)) / 60, 1),
+            # Journey depth from pipeline
+            'median_depth':       round(float(np.median(seq)), 1),
+            'p90_depth':          round(float(np.percentile(seq, 90)), 1),
+            'min_depth':          int(np.min(seq)),
+            'max_depth':          int(np.max(seq)),
+            # Depth ratio
+            'median_depth_ratio': round(float(np.median(dr)), 2),
+            # Time per page (minutes)
+            'median_time_per_page_min': round(float(np.median(tpp)) / 60, 3),
+            # Time per visit (seconds)
+            'median_time_per_visit_sec': round(float(np.median(tpv)), 1),
+        }
+
+        # Engagement features
+        for feat, key_name in [('avg_depths', 'median_avg_depth'),
+                                ('dce', 'median_dce'),
+                                ('invoca', 'median_invoca'),
+                                ('chat_react', 'median_chat_reactive'),
+                                ('chat_proact', 'median_chat_proactive')]:
+            if g[feat]:
+                row_data[key_name] = round(float(np.median(g[feat])), 1)
+
+        rows.append(row_data)
+
+    return pd.DataFrame(rows).sort_values('users', ascending=False)
+
+
+pos_journeys = build_journey_report(pos_df, min_users=5)
+
+# --- Print ---
+print("="*100)
+print(f"REPORT 1: TOP JOURNEYS — COMPLETERS ({len(pos_df):,} users)")
+print("="*100)
+print(f"Journey sets: {len(pos_journeys):,} (>= 5 users)")
+print()
+print(
+    f"{'#Pg':>3} | {'Users':>5} | "
+    f"{'MedTime':>7} | {'P90Time':>7} | {'CumTime':>7} | "
+    f"{'MedDpth':>7} | {'P90Dpth':>7} | {'DpthR':>5} | "
+    f"{'Tm/Pg':>6} | {'Tm/Vis':>6} | "
+    f"{'DCE':>4} | {'Inv':>4} | {'Chat':>4} | "
+    f"Journey"
+)
+print("-"*140)
+for _, r in pos_journeys.head(25).iterrows():
+    dce  = r.get('median_dce', 0)
+    inv  = r.get('median_invoca', 0)
+    chat = r.get('median_chat_reactive', 0) + r.get('median_chat_proactive', 0)
+    print(
+        f"{r['num_pages']:>3} | {r['users']:>5} | "
+        f"{r['median_time_min']:>5.1f}m | {r['p90_time_min']:>5.1f}m | {r['cum_time_total_min']:>5.0f}m | "
+        f"{r['median_depth']:>7.0f} | {r['p90_depth']:>7.0f} | {r['median_depth_ratio']:>5.2f} | "
+        f"{r['median_time_per_page_min']:>4.2f}m | {r['median_time_per_visit_sec']:>4.1f}s | "
+        f"{dce:>4.0f} | {inv:>4.0f} | {chat:>4.0f} | "
+        f"{r['page_set'][:30]}"
+    )
+
+pos_journeys.to_csv(f'{DATA_DIR}report1_journeys_completers_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved ({len(pos_journeys)} rows)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Next Steps
+# MAGIC
+# MAGIC For non-completers:
+# MAGIC ```python
+# MAGIC neg_journeys = build_journey_report(neg_df, min_users=5)
+# MAGIC ```
+# MAGIC
+# MAGIC Available: `pos_df`, `neg_df`, `page_data`, `pages_ordered`, all static features
