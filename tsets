@@ -1,0 +1,53 @@
+# 1. Check if model has the problematic data embedded
+print("Model feature names:")
+print(model.get_booster().feature_names)
+
+print("\nModel feature types:")
+print(model.get_booster().feature_types)
+
+# 2. The issue is likely the MODEL was trained on bad data
+# You need to RETRAIN the model with clean data
+
+# First, let's verify current data is truly clean:
+print("\n" + "="*50)
+print("Current data verification:")
+print("X_train shape:", X_train.shape)
+print("X_train dtypes unique:", X_train.dtypes.unique())
+print("X_test shape:", X_test.shape)
+
+# Check for any non-numeric values
+for col in X_train.columns:
+    try:
+        # Try to convert to float
+        _ = X_train[col].astype(float)
+    except Exception as e:
+        print(f"✗ Column {col} cannot convert to float: {e}")
+
+# 3. Create completely fresh training data
+X_train_clean = X_train.copy()
+X_test_clean = X_test.copy()
+
+# Force to float
+X_train_clean = X_train_clean.astype(np.float64)
+X_test_clean = X_test_clean.astype(np.float64)
+
+print("\nData cleaned. Shape:", X_train_clean.shape)
+
+# 4. RETRAIN the model from scratch on clean data
+import xgboost as xgb
+model_new = xgb.XGBClassifier(enable_categorical=False)
+model_new.fit(X_train_clean, y_train)
+
+print("✓ Model retrained")
+
+# 5. Now try SHAP on the NEW model
+import shap
+try:
+    explainer = shap.TreeExplainer(model_new)
+    print("✓ TreeExplainer created successfully!")
+    shap_values = explainer.shap_values(X_test_clean)
+    print("✓ SHAP values calculated!")
+except Exception as e:
+    print(f"✗ Error: {e}")
+    import traceback
+    traceback.print_exc()
