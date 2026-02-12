@@ -1,0 +1,324 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # PrefixSpan — Sequential Pattern Mining
+# MAGIC
+# MAGIC Finds frequent sub-sequences (ordered patterns) within each segment.
+# MAGIC Unlike set-based analysis, this captures ORDER — e.g., "HOME → DCE → PLAN"
+# MAGIC appears in 15K users even if their full paths differ.
+# MAGIC
+# MAGIC ### Three Segments
+# MAGIC | Segment | Filter |
+# MAGIC |---------|--------|
+# MAGIC | Completed | ole_completed_count >= 1 |
+# MAGIC | Started not completed | ole_started_count >= 1, ole_completed_count == 0 |
+# MAGIC | Never started | ole_started_count == 0 |
+
+# COMMAND ----------
+
+# MAGIC %pip install prefixspan
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+from prefixspan import PrefixSpan
+from collections import Counter
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# COMMAND ----------
+
+# ============================================================================
+# COLUMN MAPPING
+# ============================================================================
+
+COL_MCID         = 'mcid'
+COL_SEQ_RAW      = 'page_sequence_raw'
+COL_OLE_START_CT = 'ole_started_count'
+COL_OLE_COMP_CT  = 'ole_completed_count'
+
+STRUCT_POSITION  = 'seq_position'
+STRUCT_PAGE      = 'new_page_name'
+STRUCT_TIME      = 'time_delta_capped'
+
+# COMMAND ----------
+
+# ============================================================================
+# CONVERT TO PANDAS IF NEEDED
+# ============================================================================
+
+if not isinstance(page_clickstream_data, pd.DataFrame):
+    print("Converting to Pandas...")
+    page_clickstream_data = page_clickstream_data.toPandas()
+    print(f"✓ Shape: {page_clickstream_data.shape}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 1: EXTRACT ORDERED PAGE SEQUENCES
+# ============================================================================
+# PrefixSpan needs a list of sequences: [[page1, page2, page3], [page1, page4], ...]
+# Each sequence is the ordered list of pages a user visited (with repeats)
+# ============================================================================
+
+def extract_page_sequence(seq_raw):
+    """Extract ordered list of page names from page_sequence_raw."""
+    if not seq_raw:
+        return []
+
+    try:
+        sorted_seq = sorted(seq_raw,
+            key=lambda x: x[STRUCT_POSITION] if isinstance(x, dict) else getattr(x, STRUCT_POSITION))
+    except:
+        sorted_seq = seq_raw
+
+    pages = []
+    for item in sorted_seq:
+        if isinstance(item, dict):
+            page = item.get(STRUCT_PAGE, 'UNK')
+        else:
+            page = getattr(item, STRUCT_PAGE, 'UNK')
+        pages.append(page)
+
+    return pages
+
+# Build sequences if not already done
+if 'page_sequence' not in page_clickstream_data.columns:
+    page_clickstream_data['page_sequence'] = [
+        extract_page_sequence(seq) for seq in page_clickstream_data[COL_SEQ_RAW]
+    ]
+    print("✓ Extracted page sequences")
+else:
+    print("✓ page_sequence already exists")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 2: DEFINE SEGMENTS
+# ============================================================================
+
+if 'segment' not in page_clickstream_data.columns:
+    page_clickstream_data['segment'] = np.where(
+        page_clickstream_data[COL_OLE_COMP_CT] >= 1, 'completed',
+        np.where(
+            page_clickstream_data[COL_OLE_START_CT] >= 1, 'started_not_completed',
+            'never_started'
+        )
+    )
+
+for seg in ['completed', 'started_not_completed', 'never_started']:
+    n = (page_clickstream_data['segment'] == seg).sum()
+    print(f"  {seg:<25} {n:>7,}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 3: HELPER FUNCTIONS
+# ============================================================================
+
+def run_prefixspan(sequences, min_support_pct=0.05, top_k=50, max_len=6):
+    """
+    Run PrefixSpan on a list of sequences.
+
+    Args:
+        sequences: list of lists [[page1, page2], [page1, page3], ...]
+        min_support_pct: minimum support as fraction (0.05 = 5% of users)
+        top_k: return top K most frequent patterns
+        max_len: max pattern length
+
+    Returns:
+        DataFrame with pattern, support count, support %, length
+    """
+    n_users = len(sequences)
+    min_support = max(int(n_users * min_support_pct), 5)
+
+    ps = PrefixSpan(sequences)
+    ps.maxlen = max_len
+
+    # Get top-k frequent patterns
+    results = ps.topk(top_k, closed=True)
+
+    rows = []
+    for support, pattern in results:
+        rows.append({
+            'pattern': ' → '.join(pattern),
+            'pattern_list': pattern,
+            'length': len(pattern),
+            'support': support,
+            'support_pct': round(support / n_users * 100, 2),
+        })
+
+    return pd.DataFrame(rows).sort_values('support', ascending=False)
+
+
+def print_prefixspan_report(df, title, n_users, n=30):
+    """Print PrefixSpan results."""
+    print(f"\n{'='*100}")
+    print(f"{title} ({n_users:,} users)")
+    print("="*100)
+
+    if df.empty:
+        print("  No patterns found with given thresholds.")
+        return
+
+    print(f"\n{'Rank':>4} | {'Len':>3} | {'Support':>7} | {'%':>6} | Pattern")
+    print("-"*80)
+    for i, (_, r) in enumerate(df.head(n).iterrows()):
+        print(f"{i+1:>4} | {r['length']:>3} | {r['support']:>7,} | {r['support_pct']:>5.1f}% | {r['pattern']}")
+
+
+def compare_patterns(df1, df2, label1, label2):
+    """
+    Compare patterns between two segments.
+    Find patterns unique to or much more common in one segment.
+    """
+    # Merge on pattern
+    merged = pd.merge(
+        df1[['pattern', 'support_pct', 'length']],
+        df2[['pattern', 'support_pct', 'length']],
+        on='pattern', how='outer', suffixes=(f'_{label1}', f'_{label2}')
+    ).fillna(0)
+
+    merged['diff'] = merged[f'support_pct_{label1}'] - merged[f'support_pct_{label2}']
+    merged['ratio'] = np.where(
+        merged[f'support_pct_{label2}'] > 0,
+        merged[f'support_pct_{label1}'] / merged[f'support_pct_{label2}'],
+        999
+    )
+
+    return merged.sort_values('diff', ascending=False)
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 4: RUN PREFIXSPAN — COMPLETED
+# ============================================================================
+
+seq_completed = page_clickstream_data[
+    page_clickstream_data['segment'] == 'completed'
+]['page_sequence'].tolist()
+
+# Filter out empty sequences
+seq_completed = [s for s in seq_completed if len(s) >= 2]
+
+ps_completed = run_prefixspan(seq_completed, min_support_pct=0.03, top_k=50, max_len=6)
+print_prefixspan_report(ps_completed, "PREFIXSPAN: COMPLETED", len(seq_completed))
+
+ps_completed.drop(columns=['pattern_list']).to_csv(
+    f'{DATA_DIR}prefixspan_completed_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved ({len(ps_completed)} patterns)")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 5: RUN PREFIXSPAN — STARTED NOT COMPLETED
+# ============================================================================
+
+seq_snc = page_clickstream_data[
+    page_clickstream_data['segment'] == 'started_not_completed'
+]['page_sequence'].tolist()
+
+seq_snc = [s for s in seq_snc if len(s) >= 2]
+
+ps_snc = run_prefixspan(seq_snc, min_support_pct=0.03, top_k=50, max_len=6)
+print_prefixspan_report(ps_snc, "PREFIXSPAN: STARTED NOT COMPLETED", len(seq_snc))
+
+ps_snc.drop(columns=['pattern_list']).to_csv(
+    f'{DATA_DIR}prefixspan_started_not_completed_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved ({len(ps_snc)} patterns)")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 6: RUN PREFIXSPAN — NEVER STARTED
+# ============================================================================
+
+seq_ns = page_clickstream_data[
+    page_clickstream_data['segment'] == 'never_started'
+]['page_sequence'].tolist()
+
+seq_ns = [s for s in seq_ns if len(s) >= 2]
+
+ps_ns = run_prefixspan(seq_ns, min_support_pct=0.03, top_k=50, max_len=6)
+print_prefixspan_report(ps_ns, "PREFIXSPAN: NEVER STARTED", len(seq_ns))
+
+ps_ns.drop(columns=['pattern_list']).to_csv(
+    f'{DATA_DIR}prefixspan_never_started_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved ({len(ps_ns)} patterns)")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 7: COMPARE PATTERNS — COMPLETED vs NEVER STARTED
+# ============================================================================
+
+comparison = compare_patterns(ps_completed, ps_ns, 'completed', 'never_started')
+
+print(f"\n{'='*100}")
+print("PATTERN COMPARISON: COMPLETED vs NEVER STARTED")
+print("="*100)
+print("Positive diff = more common in completed users")
+print("Negative diff = more common in never_started users\n")
+
+print(f"{'Pattern':<45} | {'Comp%':>6} | {'NS%':>6} | {'Diff':>6} | {'Ratio':>6}")
+print("-"*85)
+
+# Top patterns more common in completed
+print("\n--- More common in COMPLETED ---")
+for _, r in comparison[comparison['diff'] > 0].head(15).iterrows():
+    print(f"{r['pattern'][:45]:<45} | {r['support_pct_completed']:>5.1f}% | {r['support_pct_never_started']:>5.1f}% | {r['diff']:>+5.1f} | {r['ratio']:>5.1f}x")
+
+# Top patterns more common in never_started
+print("\n--- More common in NEVER STARTED ---")
+for _, r in comparison[comparison['diff'] < 0].head(15).iterrows():
+    print(f"{r['pattern'][:45]:<45} | {r['support_pct_completed']:>5.1f}% | {r['support_pct_never_started']:>5.1f}% | {r['diff']:>+5.1f} | {r['ratio']:>5.1f}x")
+
+comparison.to_csv(f'{DATA_DIR}prefixspan_comparison_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved comparison ({len(comparison)} patterns)")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 8: COMPARE PATTERNS — COMPLETED vs STARTED NOT COMPLETED
+# ============================================================================
+
+comparison2 = compare_patterns(ps_completed, ps_snc, 'completed', 'started_nc')
+
+print(f"\n{'='*100}")
+print("PATTERN COMPARISON: COMPLETED vs STARTED NOT COMPLETED")
+print("="*100)
+print("What differentiates completers from those who started but dropped?\n")
+
+print(f"{'Pattern':<45} | {'Comp%':>6} | {'SNC%':>6} | {'Diff':>6} | {'Ratio':>6}")
+print("-"*85)
+
+print("\n--- More common in COMPLETED ---")
+for _, r in comparison2[comparison2['diff'] > 0].head(15).iterrows():
+    print(f"{r['pattern'][:45]:<45} | {r['support_pct_completed']:>5.1f}% | {r['support_pct_started_nc']:>5.1f}% | {r['diff']:>+5.1f} | {r['ratio']:>5.1f}x")
+
+print("\n--- More common in STARTED NOT COMPLETED ---")
+for _, r in comparison2[comparison2['diff'] < 0].head(15).iterrows():
+    print(f"{r['pattern'][:45]:<45} | {r['support_pct_completed']:>5.1f}% | {r['support_pct_started_nc']:>5.1f}% | {r['diff']:>+5.1f} | {r['ratio']:>5.1f}x")
+
+comparison2.to_csv(f'{DATA_DIR}prefixspan_comparison2_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved comparison2 ({len(comparison2)} patterns)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Tuning Parameters
+# MAGIC
+# MAGIC If results are too noisy or too few:
+# MAGIC
+# MAGIC | Parameter | Current | Increase to | Effect |
+# MAGIC |-----------|---------|-------------|--------|
+# MAGIC | `min_support_pct` | 0.03 (3%) | 0.05 or 0.10 | Fewer, more common patterns |
+# MAGIC | `top_k` | 50 | 100 | More patterns returned |
+# MAGIC | `max_len` | 6 | 4 or 8 | Shorter/longer patterns |
+# MAGIC
+# MAGIC Use `closed=True` (current) to avoid redundant sub-patterns.
+# MAGIC Change to `closed=False` for all patterns including subsets.
