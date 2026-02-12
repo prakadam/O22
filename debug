@@ -1,0 +1,31 @@
+# 1. Check ALL data types
+print("Data types:")
+print(X_train.dtypes.value_counts())
+
+# 2. Check for hidden issues
+print("\nColumns with dtype 'object':")
+print(X_train.select_dtypes(include=['object']).columns.tolist())
+
+# 3. Check if there are actual string VALUES in numeric columns
+print("\nChecking for string values in each column:")
+for col in X_train.columns:
+    # Check if any values are strings
+    sample = X_train[col].head()
+    print(f"{col}: dtype={X_train[col].dtype}, sample values={sample.values[:3]}")
+    
+    # Check for non-numeric values
+    if pd.api.types.is_numeric_dtype(X_train[col]):
+        continue
+    else:
+        print(f"  ⚠️ {col} is NOT numeric!")
+
+# 4. Try converting everything to numeric explicitly
+X_train_clean = X_train.apply(pd.to_numeric, errors='coerce')
+X_test_clean = X_test.apply(pd.to_numeric, errors='coerce')
+
+# Fill any NaN created by conversion
+X_train_clean = X_train_clean.fillna(0)
+X_test_clean = X_test_clean.fillna(0)
+
+print("\nAfter conversion:")
+print(X_train_clean.dtypes.value_counts())
