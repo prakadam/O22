@@ -1,0 +1,626 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # XGBoost + SHAP — Journey Conversion Analysis
+# MAGIC
+# MAGIC ### Model 1: Completed vs Not Completed (everyone)
+# MAGIC ### Model 2: Started vs Never Started (among non-completers)
+# MAGIC
+# MAGIC Features: per-page (visits + time) + static + derived
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+import shap
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# COMMAND ----------
+
+# ============================================================================
+# COLUMN MAPPING (same as journey analysis notebook)
+# ============================================================================
+
+COL_MCID         = 'mcid'
+COL_SEQ_RAW      = 'page_sequence_raw'
+
+COL_OLE_START_CT = 'ole_started_count'
+COL_OLE_COMP_CT  = 'ole_completed_count'
+COL_OLE_START_FL = 'ole_started_flag'
+COL_OLE_COMP_FL  = 'ole_completed_flag'
+
+COL_VISIT_COUNT  = 'visit_count'
+COL_SEQ_LEN      = 'sequence_length'
+COL_UNIQUE_PAGES = 'unique_pages'
+COL_AVG_DEPTH    = 'avg_visit_depth'
+COL_DCE          = 'dce_used'
+COL_MEMBER       = 'member_flag'
+COL_SHOPPER      = 'shopper_profile'
+COL_SHOPPER_AUTH = 'shopper_profile_auth'
+COL_INVOCA       = 'invoca_calls'
+COL_CHAT_REACT   = 'chat_reactive_clicks'
+COL_CHAT_PROACT  = 'chat_proactive_yes'
+COL_DAYS         = 'days_in_research_phase'
+
+STRUCT_POSITION  = 'seq_position'
+STRUCT_PAGE      = 'new_page_name'
+STRUCT_TIME      = 'time_delta_capped'
+
+# Static features for XGBoost (NO ole fields — those leak)
+STATIC_FEATURES = [
+    COL_VISIT_COUNT, COL_SEQ_LEN, COL_UNIQUE_PAGES, COL_AVG_DEPTH,
+    COL_DCE, COL_MEMBER, COL_SHOPPER, COL_SHOPPER_AUTH,
+    COL_INVOCA, COL_CHAT_REACT, COL_CHAT_PROACT, COL_DAYS
+]
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 1: ENSURE page_data EXISTS
+# ============================================================================
+# If you already ran the journey analysis notebook, page_data is ready.
+# If not, this cell extracts it.
+
+if 'page_data' not in page_clickstream_data.columns:
+    print("Extracting page_data from page_sequence_raw...")
+
+    def extract_from_raw_sequence(seq_raw):
+        if not seq_raw:
+            return {}, 0.0
+        try:
+            sorted_seq = sorted(seq_raw,
+                key=lambda x: x[STRUCT_POSITION] if isinstance(x, dict) else getattr(x, STRUCT_POSITION))
+        except:
+            sorted_seq = seq_raw
+
+        page_data = {}
+        total_time = 0.0
+        for item in sorted_seq:
+            if isinstance(item, dict):
+                page = item.get(STRUCT_PAGE, 'UNK')
+                t = float(item.get(STRUCT_TIME, 0) or 0)
+            else:
+                page = getattr(item, STRUCT_PAGE, 'UNK')
+                t = float(getattr(item, STRUCT_TIME, 0) or 0)
+            total_time += t
+            if page in page_data:
+                page_data[page]['cum_time'] += t
+                page_data[page]['visits'] += 1
+            else:
+                page_data[page] = {'cum_time': t, 'visits': 1}
+        return page_data, total_time
+
+    page_data_list = []
+    total_time_list = []
+    for seq_raw in page_clickstream_data[COL_SEQ_RAW]:
+        pd_, tt_ = extract_from_raw_sequence(seq_raw)
+        page_data_list.append(pd_)
+        total_time_list.append(tt_)
+
+    page_clickstream_data['page_data']  = page_data_list
+    page_clickstream_data['total_time'] = total_time_list
+    print("✓ Extracted")
+else:
+    print("✓ page_data already exists")
+
+# Derived (if not already computed)
+if 'time_per_page' not in page_clickstream_data.columns:
+    page_clickstream_data['time_per_page'] = np.where(
+        page_clickstream_data[COL_UNIQUE_PAGES] > 0,
+        page_clickstream_data['total_time'] / page_clickstream_data[COL_UNIQUE_PAGES], 0)
+    page_clickstream_data['time_per_visit'] = np.where(
+        page_clickstream_data[COL_VISIT_COUNT] > 0,
+        page_clickstream_data['total_time'] / page_clickstream_data[COL_VISIT_COUNT], 0)
+    page_clickstream_data['pages_per_visit'] = np.where(
+        page_clickstream_data[COL_VISIT_COUNT] > 0,
+        page_clickstream_data[COL_SEQ_LEN] / page_clickstream_data[COL_VISIT_COUNT], 0)
+
+DERIVED_FEATURES = ['total_time', 'time_per_page', 'time_per_visit', 'pages_per_visit']
+
+print(f"Shape: {page_clickstream_data.shape}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 2: BUILD FEATURE MATRIX
+# ============================================================================
+# Per-page features: {page}_visits, {page}_time
+# Dynamic — adapts to whatever pages exist in the data
+# ============================================================================
+
+# Discover all unique pages
+all_pages = set()
+for pd_ in page_clickstream_data['page_data']:
+    all_pages.update(pd_.keys())
+all_pages = sorted(all_pages)
+print(f"Unique pages: {len(all_pages)}")
+print(f"  {all_pages}")
+
+# Build per-page feature columns
+page_visits_data = {}
+page_time_data = {}
+
+for page in all_pages:
+    col_visits = f'pg_{page}_visits'
+    col_time = f'pg_{page}_time'
+    page_visits_data[col_visits] = []
+    page_time_data[col_time] = []
+
+for pd_ in page_clickstream_data['page_data']:
+    for page in all_pages:
+        col_visits = f'pg_{page}_visits'
+        col_time = f'pg_{page}_time'
+        if page in pd_:
+            page_visits_data[col_visits].append(pd_[page]['visits'])
+            page_time_data[col_time].append(pd_[page]['cum_time'])
+        else:
+            page_visits_data[col_visits].append(0)
+            page_time_data[col_time].append(0.0)
+
+# Add to dataframe
+for col, vals in {**page_visits_data, **page_time_data}.items():
+    page_clickstream_data[col] = vals
+
+PAGE_FEATURES = [f'pg_{p}_visits' for p in all_pages] + [f'pg_{p}_time' for p in all_pages]
+
+ALL_FEATURES = STATIC_FEATURES + DERIVED_FEATURES + PAGE_FEATURES
+
+print(f"\nFeature count:")
+print(f"  Static:  {len(STATIC_FEATURES)}")
+print(f"  Derived: {len(DERIVED_FEATURES)}")
+print(f"  Page:    {len(PAGE_FEATURES)} ({len(all_pages)} pages × 2)")
+print(f"  Total:   {len(ALL_FEATURES)}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 3: DEFINE TARGETS
+# ============================================================================
+
+# Model 1: Completed (1) vs not completed (0) — everyone
+page_clickstream_data['target_completed'] = (page_clickstream_data[COL_OLE_COMP_CT] >= 1).astype(int)
+
+# Model 2: Started (1) vs never started (0) — among non-completers only
+page_clickstream_data['target_started'] = (page_clickstream_data[COL_OLE_START_CT] >= 1).astype(int)
+
+print("Target distributions:")
+print(f"\nModel 1 — Completed vs Not (all users):")
+print(page_clickstream_data['target_completed'].value_counts().to_string())
+print(f"  Rate: {page_clickstream_data['target_completed'].mean()*100:.1f}%")
+
+non_completers = page_clickstream_data[page_clickstream_data['target_completed'] == 0]
+print(f"\nModel 2 — Started vs Never Started (non-completers only):")
+print(non_completers['target_started'].value_counts().to_string())
+print(f"  Rate: {non_completers['target_started'].mean()*100:.1f}%")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 4: VERIFY FEATURE MATRIX — no NaN, no inf
+# ============================================================================
+
+X_all = page_clickstream_data[ALL_FEATURES]
+
+print("Feature matrix check:")
+print(f"  Shape: {X_all.shape}")
+print(f"  NaN:   {X_all.isna().sum().sum()}")
+print(f"  Inf:   {np.isinf(X_all.select_dtypes(include=[np.number])).sum().sum()}")
+
+# Fill any NaN/inf
+X_all = X_all.fillna(0).replace([np.inf, -np.inf], 0)
+page_clickstream_data[ALL_FEATURES] = X_all
+
+print("  ✓ Cleaned")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Model 1: Completed vs Not Completed
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: TRAIN / TEST SPLIT
+# ============================================================================
+
+X = page_clickstream_data[ALL_FEATURES]
+y = page_clickstream_data['target_completed']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"Train: {len(X_train):,} ({y_train.mean()*100:.1f}% positive)")
+print(f"Test:  {len(X_test):,} ({y_test.mean()*100:.1f}% positive)")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: TRAIN XGBOOST
+# ============================================================================
+
+# Calculate scale_pos_weight for class imbalance
+neg_count = (y_train == 0).sum()
+pos_count = (y_train == 1).sum()
+scale_weight = neg_count / pos_count
+
+model1 = xgb.XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=scale_weight,
+    eval_metric='auc',
+    random_state=42,
+    use_label_encoder=False,
+)
+
+model1.fit(
+    X_train, y_train,
+    eval_set=[(X_test, y_test)],
+    verbose=50
+)
+
+print("\n✓ Model 1 trained")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: EVALUATE ON TEST
+# ============================================================================
+
+y_pred = model1.predict(X_test)
+y_prob = model1.predict_proba(X_test)[:, 1]
+
+print("="*60)
+print("MODEL 1: COMPLETED vs NOT — TEST SET")
+print("="*60)
+print(f"\nAUC-ROC: {roc_auc_score(y_test, y_prob):.4f}")
+print(f"\nClassification Report:")
+print(classification_report(y_test, y_pred, target_names=['Not Completed', 'Completed']))
+print(f"Confusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+print(f"  TN={cm[0,0]:,}  FP={cm[0,1]:,}")
+print(f"  FN={cm[1,0]:,}  TP={cm[1,1]:,}")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: SHAP ON TEST SET
+# ============================================================================
+
+explainer1 = shap.TreeExplainer(model1)
+shap_values1 = explainer1.shap_values(X_test)
+
+print("✓ SHAP values computed for Model 1")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: SHAP — FEATURE IMPORTANCE (TOP 30)
+# ============================================================================
+
+shap.summary_plot(shap_values1, X_test, max_display=30, show=False)
+plt.title("Model 1: Completed vs Not — SHAP Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model1_shap_summary.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved model1_shap_summary.png")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: SHAP — BAR PLOT (mean |SHAP|)
+# ============================================================================
+
+shap.summary_plot(shap_values1, X_test, plot_type='bar', max_display=30, show=False)
+plt.title("Model 1: Mean |SHAP| — Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model1_shap_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved model1_shap_bar.png")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: TOP FEATURES TABLE
+# ============================================================================
+
+mean_shap = np.abs(shap_values1).mean(axis=0)
+feature_importance = pd.DataFrame({
+    'feature': ALL_FEATURES,
+    'mean_abs_shap': mean_shap
+}).sort_values('mean_abs_shap', ascending=False)
+
+print("\nModel 1 — Top 30 Features by Mean |SHAP|:")
+print(f"{'Rank':>4} | {'Feature':<35} | {'Mean |SHAP|':>12}")
+print("-"*60)
+for i, (_, row) in enumerate(feature_importance.head(30).iterrows()):
+    print(f"{i+1:>4} | {row['feature']:<35} | {row['mean_abs_shap']:>12.4f}")
+
+feature_importance.to_csv(f'{DATA_DIR}model1_feature_importance_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved feature importance ({len(feature_importance)} features)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Model 2: Started vs Never Started (non-completers only)
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: TRAIN / TEST SPLIT (non-completers only)
+# ============================================================================
+
+non_comp = page_clickstream_data[page_clickstream_data['target_completed'] == 0].copy()
+
+X2 = non_comp[ALL_FEATURES]
+y2 = non_comp['target_started']
+
+X2_train, X2_test, y2_train, y2_test = train_test_split(
+    X2, y2, test_size=0.2, random_state=42, stratify=y2
+)
+
+print(f"Non-completers: {len(non_comp):,}")
+print(f"Train: {len(X2_train):,} ({y2_train.mean()*100:.1f}% started)")
+print(f"Test:  {len(X2_test):,} ({y2_test.mean()*100:.1f}% started)")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: TRAIN XGBOOST
+# ============================================================================
+
+neg2 = (y2_train == 0).sum()
+pos2 = (y2_train == 1).sum()
+scale_weight2 = neg2 / pos2
+
+model2 = xgb.XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=scale_weight2,
+    eval_metric='auc',
+    random_state=42,
+    use_label_encoder=False,
+)
+
+model2.fit(
+    X2_train, y2_train,
+    eval_set=[(X2_test, y2_test)],
+    verbose=50
+)
+
+print("\n✓ Model 2 trained")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: EVALUATE ON TEST
+# ============================================================================
+
+y2_pred = model2.predict(X2_test)
+y2_prob = model2.predict_proba(X2_test)[:, 1]
+
+print("="*60)
+print("MODEL 2: STARTED vs NEVER STARTED — TEST SET")
+print("="*60)
+print(f"\nAUC-ROC: {roc_auc_score(y2_test, y2_prob):.4f}")
+print(f"\nClassification Report:")
+print(classification_report(y2_test, y2_pred, target_names=['Never Started', 'Started']))
+print(f"Confusion Matrix:")
+cm2 = confusion_matrix(y2_test, y2_pred)
+print(f"  TN={cm2[0,0]:,}  FP={cm2[0,1]:,}")
+print(f"  FN={cm2[1,0]:,}  TP={cm2[1,1]:,}")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: SHAP ON TEST SET
+# ============================================================================
+
+explainer2 = shap.TreeExplainer(model2)
+shap_values2 = explainer2.shap_values(X2_test)
+
+print("✓ SHAP values computed for Model 2")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: SHAP — FEATURE IMPORTANCE (TOP 30)
+# ============================================================================
+
+shap.summary_plot(shap_values2, X2_test, max_display=30, show=False)
+plt.title("Model 2: Started vs Never Started — SHAP Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model2_shap_summary.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved model2_shap_summary.png")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: SHAP — BAR PLOT
+# ============================================================================
+
+shap.summary_plot(shap_values2, X2_test, plot_type='bar', max_display=30, show=False)
+plt.title("Model 2: Mean |SHAP| — Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model2_shap_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved model2_shap_bar.png")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: TOP FEATURES TABLE
+# ============================================================================
+
+mean_shap2 = np.abs(shap_values2).mean(axis=0)
+feature_importance2 = pd.DataFrame({
+    'feature': ALL_FEATURES,
+    'mean_abs_shap': mean_shap2
+}).sort_values('mean_abs_shap', ascending=False)
+
+print("\nModel 2 — Top 30 Features by Mean |SHAP|:")
+print(f"{'Rank':>4} | {'Feature':<35} | {'Mean |SHAP|':>12}")
+print("-"*60)
+for i, (_, row) in enumerate(feature_importance2.head(30).iterrows()):
+    print(f"{i+1:>4} | {row['feature']:<35} | {row['mean_abs_shap']:>12.4f}")
+
+feature_importance2.to_csv(f'{DATA_DIR}model2_feature_importance_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved feature importance ({len(feature_importance2)} features)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Final: SHAP on Entire Dataset
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1: RETRAIN ON FULL DATA + SHAP
+# ============================================================================
+
+X_full = page_clickstream_data[ALL_FEATURES]
+y_full = page_clickstream_data['target_completed']
+
+model1_full = xgb.XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=(y_full == 0).sum() / (y_full == 1).sum(),
+    eval_metric='auc',
+    random_state=42,
+    use_label_encoder=False,
+)
+model1_full.fit(X_full, y_full, verbose=50)
+
+explainer1_full = shap.TreeExplainer(model1_full)
+shap_values1_full = explainer1_full.shap_values(X_full)
+
+print("✓ Model 1 retrained on full data + SHAP computed")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 1 FULL: SHAP PLOTS
+# ============================================================================
+
+shap.summary_plot(shap_values1_full, X_full, max_display=30, show=False)
+plt.title("Model 1 (Full): Completed vs Not — SHAP Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model1_full_shap_summary.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+shap.summary_plot(shap_values1_full, X_full, plot_type='bar', max_display=30, show=False)
+plt.title("Model 1 (Full): Mean |SHAP| — Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model1_full_shap_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# Top features
+mean_shap_full = np.abs(shap_values1_full).mean(axis=0)
+fi_full = pd.DataFrame({
+    'feature': ALL_FEATURES,
+    'mean_abs_shap': mean_shap_full
+}).sort_values('mean_abs_shap', ascending=False)
+
+print("\nModel 1 (Full Data) — Top 30 Features:")
+print(f"{'Rank':>4} | {'Feature':<35} | {'Mean |SHAP|':>12}")
+print("-"*60)
+for i, (_, row) in enumerate(fi_full.head(30).iterrows()):
+    print(f"{i+1:>4} | {row['feature']:<35} | {row['mean_abs_shap']:>12.4f}")
+
+fi_full.to_csv(f'{DATA_DIR}model1_full_feature_importance_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved full model feature importance")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2: RETRAIN ON FULL NON-COMPLETERS + SHAP
+# ============================================================================
+
+X2_full = non_comp[ALL_FEATURES]
+y2_full = non_comp['target_started']
+
+model2_full = xgb.XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=(y2_full == 0).sum() / (y2_full == 1).sum(),
+    eval_metric='auc',
+    random_state=42,
+    use_label_encoder=False,
+)
+model2_full.fit(X2_full, y2_full, verbose=50)
+
+explainer2_full = shap.TreeExplainer(model2_full)
+shap_values2_full = explainer2_full.shap_values(X2_full)
+
+print("✓ Model 2 retrained on full non-completers + SHAP computed")
+
+# COMMAND ----------
+
+# ============================================================================
+# MODEL 2 FULL: SHAP PLOTS
+# ============================================================================
+
+shap.summary_plot(shap_values2_full, X2_full, max_display=30, show=False)
+plt.title("Model 2 (Full): Started vs Never Started — SHAP Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model2_full_shap_summary.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+shap.summary_plot(shap_values2_full, X2_full, plot_type='bar', max_display=30, show=False)
+plt.title("Model 2 (Full): Mean |SHAP| — Feature Importance")
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}model2_full_shap_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+mean_shap2_full = np.abs(shap_values2_full).mean(axis=0)
+fi2_full = pd.DataFrame({
+    'feature': ALL_FEATURES,
+    'mean_abs_shap': mean_shap2_full
+}).sort_values('mean_abs_shap', ascending=False)
+
+print("\nModel 2 (Full Data) — Top 30 Features:")
+print(f"{'Rank':>4} | {'Feature':<35} | {'Mean |SHAP|':>12}")
+print("-"*60)
+for i, (_, row) in enumerate(fi2_full.head(30).iterrows()):
+    print(f"{i+1:>4} | {row['feature']:<35} | {row['mean_abs_shap']:>12.4f}")
+
+fi2_full.to_csv(f'{DATA_DIR}model2_full_feature_importance_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved full model 2 feature importance")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+# MAGIC
+# MAGIC | Model | Target | Population | Use |
+# MAGIC |-------|--------|------------|-----|
+# MAGIC | Model 1 (test) | Completed vs Not | 80/20 split | Validate performance |
+# MAGIC | Model 1 (full) | Completed vs Not | All users | Final SHAP insights |
+# MAGIC | Model 2 (test) | Started vs Never | 80/20 non-completers | Validate performance |
+# MAGIC | Model 2 (full) | Started vs Never | All non-completers | Final SHAP insights |
+# MAGIC
+# MAGIC ### Key outputs:
+# MAGIC - `model1_shap_summary.png` — which features push toward/away from completion
+# MAGIC - `model2_shap_summary.png` — which features push toward/away from starting
+# MAGIC - Feature importance CSVs — ranked list of all features by SHAP impact
