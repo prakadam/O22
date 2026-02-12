@@ -1,0 +1,36 @@
+import pandas as pd
+import numpy as np
+
+# Function to clean scientific notation strings with brackets
+def clean_scientific_notation(val):
+    if isinstance(val, str):
+        # Remove brackets and convert
+        val = val.strip('[]')
+        try:
+            return float(val)
+        except:
+            return np.nan
+    return val
+
+# Apply to all columns
+for col in X_train.columns:
+    X_train[col] = X_train[col].apply(clean_scientific_notation)
+    X_test[col] = X_test[col].apply(clean_scientific_notation)
+
+# Fill any NaN values
+X_train = X_train.fillna(0)
+X_test = X_test.fillna(0)
+
+# Ensure float dtype
+X_train = X_train.astype(float)
+X_test = X_test.astype(float)
+
+# Now retrain the model
+import xgboost as xgb
+model = xgb.XGBClassifier()
+model.fit(X_train, y_train)
+
+# SHAP should work now
+import shap
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
