@@ -1,0 +1,30 @@
+# ============================================================================
+# USER TYPE FILTERS
+# ============================================================================
+
+USER_TYPE_COLS = ['user_type_1', 'user_type_2', 'user_type_3', 'user_type_4']
+SEGMENTS = ['completed', 'started_not_completed', 'never_started']
+
+for ut_col in USER_TYPE_COLS:
+    if ut_col not in page_clickstream_data.columns:
+        print(f"✗ {ut_col} not found — skipping")
+        continue
+    
+    for seg in SEGMENTS:
+        mask = (
+            (page_clickstream_data['segment'] == seg) &
+            (page_clickstream_data[ut_col] == 1)
+        )
+        subset_seqs = page_clickstream_data[mask]['page_sequence'].tolist()
+        subset_seqs = [s for s in subset_seqs if len(s) >= 2]
+        
+        if len(subset_seqs) < 10:
+            print(f"\n⚠ {ut_col} + {seg}: only {len(subset_seqs)} users — skipping")
+            continue
+        
+        ps_result = run_prefixspan(subset_seqs, min_support_pct=0.03, top_k=50, max_len=6)
+        print_prefixspan_report(ps_result, f"PREFIXSPAN: {ut_col} + {seg}", len(subset_seqs))
+        
+        ps_result.drop(columns=['pattern_list']).to_csv(
+            f'{DATA_DIR}prefixspan_{ut_col}_{seg}_{MODEL_NAME}.csv', index=False)
+        print(f"✓ Saved ({len(ps_result)} patterns)")
